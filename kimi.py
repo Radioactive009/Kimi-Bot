@@ -1,0 +1,1352 @@
+"""
+Kimi - A simple Python voice assistant.
+
+Features:
+1. Listens to voice input from microphone.
+2. Converts speech to text.
+3. Speaks responses using text-to-speech.
+4. Handles basic commands:
+   - Open Google Chrome
+   - Open YouTube
+   - Tell current time
+   - Answer "who are you"
+5. Uses AI fallback for general questions when no predefined command matches.
+"""
+
+import datetime
+import difflib
+import json
+import os
+import random
+import re
+import subprocess
+import time
+import urllib.parse
+import webbrowser
+from pathlib import Path
+
+import pyttsx3
+import speech_recognition as sr
+from dotenv import load_dotenv
+from groq import Groq
+try:
+    import pywhatkit
+except ImportError:
+    pywhatkit = None
+
+# Load environment variables from .env file.
+load_dotenv()
+
+
+# Initialize the text-to-speech engine once (faster and cleaner).
+engine = pyttsx3.init()
+
+# Stores the latest conversation messages in role-based format.
+# We keep only the last 5 interactions (10 messages: user + assistant).
+conversation_history = []
+MAX_HISTORY_MESSAGES = 10
+
+# Stores simple personalized user details in runtime memory.
+# Example: {"name": "Kislay", "likes": ["gym", "music"]}
+user_memory = {}
+
+# Groq model fallback chain.
+# Default is a stable production model as per Groq deprecation guidance.
+DEFAULT_MODEL = "llama-3.1-8b-instant"
+FALLBACK_MODELS = [
+    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+]
+
+EXIT_KEYWORDS = {"exit", "quit", "stop"}
+MAX_LISTEN_RETRIES = 3
+MAX_FILE_SEARCH_RESULTS = 10
+MAX_APP_LIST_RESULTS = 25
+APP_INDEX_CACHE = None
+FILE_SEARCH_TIME_BUDGET_SEC = 8
+AGENT_ACTION_ACKS = [
+    "Right away",
+    "On it",
+    "Certainly",
+    "Consider it done",
+    "Absolutely",
+]
+AGENT_STARTUP_LINES = [
+    "Hello. Kimi online and ready.",
+    "Kimi online. Awaiting your instructions.",
+    "Good to have you back. I am ready when you are.",
+]
+
+
+def configure_voice():
+    """
+    Configure a youthful female-sounding voice when available.
+    You can override by setting env var KIMI_VOICE_NAME to part of a voice name/id.
+    """
+    try:
+        voices = engine.getProperty("voices")
+        preferred_markers = [
+            "zira",
+            "female",
+            "samantha",
+            "hazel",
+            "aria",
+            "eva",
+            "jenny",
+            "sonia",
+            "neural",
+        ]
+        voice_override = os.getenv("KIMI_VOICE_NAME", "").strip().lower()
+
+        selected_voice_id = None
+        # Highest priority: explicit user override.
+        if voice_override:
+            for voice in voices:
+                voice_name = f"{getattr(voice, 'name', '')} {getattr(voice, 'id', '')}".lower()
+                if voice_override in voice_name:
+                    selected_voice_id = voice.id
+                    break
+
+        # Fallback: best-effort youthful female profile.
+        if not selected_voice_id:
+            for voice in voices:
+                voice_name = f"{getattr(voice, 'name', '')} {getattr(voice, 'id', '')}".lower()
+                if any(marker in voice_name for marker in preferred_markers):
+                    selected_voice_id = voice.id
+                    break
+
+        if selected_voice_id:
+            engine.setProperty("voice", selected_voice_id)
+
+        # Tuned for a younger, conversational style.
+        engine.setProperty("rate", 185)
+        engine.setProperty("volume", 1.0)
+    except Exception as error:
+        print(f"Voice configuration warning: {error}")
+
+
+configure_voice()
+
+
+def speak(text):
+    """
+    Convert text to speech and say it out loud.
+    Also prints text so user can see assistant responses in terminal.
+    """
+    global engine
+    print(f"Kimi: {text}")
+    try:
+        engine.say(text)
+        engine.runAndWait()
+    except Exception as error:
+        # Recover TTS engine once if runtime voice playback fails.
+        print(f"TTS error (recovering): {error}")
+        try:
+            engine = pyttsx3.init()
+            configure_voice()
+            engine.say(text)
+            engine.runAndWait()
+        except Exception as retry_error:
+            # Final fallback: keep terminal output even if speech is unavailable.
+            print(f"TTS recovery failed: {retry_error}")
+
+
+def compose_action_reply(text):
+    """
+    Add a polished acknowledgement so Kimi sounds more like a premium agent.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return random.choice(AGENT_ACTION_ACKS) + "."
+    return f"{random.choice(AGENT_ACTION_ACKS)}. {cleaned}"
+
+
+def respond_and_remember(user_text, assistant_text, is_action=False):
+    """
+    Unified response helper for natural talk-back + conversation memory.
+    """
+    final_text = compose_action_reply(assistant_text) if is_action else assistant_text
+    speak(final_text)
+    add_to_history("user", user_text)
+    add_to_history("assistant", final_text)
+
+
+def add_to_history(role, content):
+    """
+    Add one message to runtime conversation history and trim old entries.
+    This helps the AI remember short-term context from recent turns.
+    """
+    conversation_history.append({"role": role, "content": content})
+
+    if len(conversation_history) > MAX_HISTORY_MESSAGES:
+        # Keep only the most recent messages.
+        overflow = len(conversation_history) - MAX_HISTORY_MESSAGES
+        del conversation_history[:overflow]
+
+
+def update_memory(command):
+    """
+    Extract simple user details from natural language and store them.
+    Runtime-only memory (clears when app restarts).
+    """
+    text = command.strip()
+    if not text:
+        return
+
+    # Pattern: "my name is kislay"
+    name_match = re.search(r"\bmy name is\s+([a-zA-Z][a-zA-Z\s'-]{0,40})\b", text, re.IGNORECASE)
+    if name_match:
+        user_memory["name"] = name_match.group(1).strip().title()
+
+    # Pattern: "i like gym"
+    like_match = re.search(r"\bi like\s+([a-zA-Z0-9][a-zA-Z0-9\s'-]{0,60})\b", text, re.IGNORECASE)
+    if like_match:
+        item = like_match.group(1).strip().lower()
+        likes = user_memory.get("likes", [])
+        if item not in likes:
+            likes.append(item)
+        user_memory["likes"] = likes
+
+
+def build_memory_context():
+    """
+    Convert stored user memory into short text for system guidance.
+    This helps AI responses feel personalized and consistent.
+    """
+    parts = []
+    if "name" in user_memory:
+        parts.append(f"name: {user_memory['name']}")
+    if "likes" in user_memory and user_memory["likes"]:
+        parts.append("likes: " + ", ".join(user_memory["likes"]))
+
+    if not parts:
+        return "No personal details saved yet."
+    return "Known user details -> " + "; ".join(parts) + "."
+
+
+def open_browser():
+    """Tool: open the default browser (Chrome preferred)."""
+    return open_chrome()
+
+
+def open_brave():
+    """Tool: open Brave browser on Windows."""
+    brave_paths = [
+        r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+        r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+    ]
+    for path in brave_paths:
+        if os.path.exists(path):
+            os.startfile(path)
+            return "Opening Brave browser."
+
+    # Fallback: attempt system app alias.
+    try:
+        subprocess.Popen(["cmd", "/c", "start", "", "brave"], shell=False)
+        return "Opening Brave browser."
+    except Exception:
+        return "Brave browser was not found on this system."
+
+
+def open_file_manager():
+    """Tool: open Windows File Explorer (file manager)."""
+    try:
+        os.startfile("explorer.exe")
+        return "Opening File Explorer."
+    except Exception as error:
+        return f"Failed to open File Explorer: {error}"
+
+
+def open_whatsapp():
+    """Tool: open WhatsApp desktop app using multiple launch strategies."""
+    # 1) Common install paths (preferred for reliable process control).
+    local_appdata = os.getenv("LOCALAPPDATA", "")
+    candidate_paths = [
+        Path(local_appdata) / r"WhatsApp\WhatsApp.exe",
+        Path(local_appdata) / r"Programs\WhatsApp\WhatsApp.exe",
+        Path(local_appdata) / r"WhatsApp Beta\WhatsApp Beta.exe",
+    ]
+    for exe_path in candidate_paths:
+        try:
+            if exe_path.exists():
+                os.startfile(str(exe_path))
+                return "Opening WhatsApp."
+        except Exception:
+            continue
+
+    # 2) App alias fallback.
+    try:
+        subprocess.Popen(["cmd", "/c", "start", "", "WhatsApp.exe"], shell=False)
+        return "Opening WhatsApp."
+    except Exception:
+        pass
+
+    # 3) URI scheme fallback.
+    try:
+        os.startfile("whatsapp:")
+        return "Opening WhatsApp."
+    except Exception:
+        return "WhatsApp was not found on this system."
+
+
+def open_youtube():
+    """Tool: open YouTube homepage."""
+    webbrowser.open("https://www.youtube.com")
+    return "Opening YouTube."
+
+
+def search_youtube(query):
+    """Tool: search YouTube for a specific query."""
+    q = (query or "").strip()
+    if not q:
+        webbrowser.open("https://www.youtube.com")
+        return "Opening YouTube."
+    encoded = urllib.parse.quote_plus(q)
+    webbrowser.open(f"https://www.youtube.com/results?search_query={encoded}")
+    return f"Searching YouTube for {q}."
+
+
+def play_youtube(query):
+    """
+    Tool: play first matching YouTube video.
+    Uses pywhatkit when available; falls back to YouTube search page.
+    """
+    q = (query or "").strip() or "random video"
+
+    if pywhatkit is not None:
+        try:
+            pywhatkit.playonyt(q)
+            return f"Playing {q} on YouTube."
+        except Exception as error:
+            print(f"pywhatkit play fallback: {error}")
+
+    # Fallback when pywhatkit is unavailable or fails.
+    return search_youtube(q)
+
+
+def close_browser():
+    """Tool: close common browser windows on Windows (Chrome/Brave)."""
+    try:
+        closed_any = close_process_candidates(["chrome.exe", "brave.exe"])
+        if closed_any:
+            return "Closed browser windows."
+        return "No Chrome or Brave browser window was running."
+    except Exception as error:
+        return f"Failed to close browser: {error}"
+
+
+def get_running_process_names():
+    """Return running process image names using Windows tasklist."""
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return []
+
+        process_names = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('"'):
+                first = line.split('","', 1)[0].strip('"')
+            else:
+                first = line.split(",", 1)[0]
+            if first:
+                process_names.append(first)
+        return process_names
+    except Exception:
+        return []
+
+
+def close_process_candidates(candidates):
+    """
+    Try to close any running process from candidate image names.
+    Returns True if at least one process was terminated.
+    """
+    closed_any = False
+    for proc in candidates:
+        try:
+            result = subprocess.run(
+                ["taskkill", "/IM", proc, "/F"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                closed_any = True
+        except Exception:
+            continue
+    return closed_any
+
+
+def open_application(app_name):
+    """
+    Tool: open an application by name.
+    Uses known mappings first, then Windows start command fallback.
+    """
+    name = (app_name or "").strip().lower()
+    if not name:
+        return "Please tell me which app to open."
+
+    app_aliases = {
+        "brave": open_brave,
+        "brave browser": open_brave,
+        "chrome": open_chrome,
+        "google chrome": open_chrome,
+        "browser": open_browser,
+        "file manager": open_file_manager,
+        "file explorer": open_file_manager,
+        "explorer": open_file_manager,
+        "files": open_file_manager,
+        "whatsapp": open_whatsapp,
+        "whats app": open_whatsapp,
+    }
+    mapped = app_aliases.get(name)
+    if mapped:
+        return mapped()
+
+    # Try installed app index first for better reliability.
+    installed_reply = open_installed_app(name)
+    if not installed_reply.lower().startswith("i could not find an installed app"):
+        return installed_reply
+
+    try:
+        subprocess.Popen(["cmd", "/c", "start", "", name], shell=False)
+        return f"Opening {name}."
+    except Exception:
+        return f"I could not open {name} on this system."
+
+
+def close_application(app_name):
+    """
+    Tool: close an application by name.
+    Uses process name mapping and taskkill fallback.
+    """
+    name = (app_name or "").strip().lower()
+    if not name:
+        return "Please tell me which app to close."
+
+    process_map = {
+        "notepad": ["notepad.exe"],
+        "chrome": ["chrome.exe"],
+        "google chrome": ["chrome.exe"],
+        "brave": ["brave.exe"],
+        "brave browser": ["brave.exe"],
+        "calculator": ["calculatorapp.exe", "calculator.exe"],
+        "calc": ["calculatorapp.exe", "calculator.exe"],
+        "whatsapp": ["WhatsApp.exe", "WhatsApp Beta.exe", "WhatsAppBeta.exe", "WhatsAppDesktop.exe"],
+        "whats app": ["WhatsApp.exe", "WhatsApp Beta.exe", "WhatsAppBeta.exe", "WhatsAppDesktop.exe"],
+        "file explorer": ["explorer.exe"],
+        "file manager": ["explorer.exe"],
+    }
+
+    candidates = list(process_map.get(name, [name if name.endswith(".exe") else f"{name}.exe"]))
+
+    # Dynamic fallback: add running process names that contain requested app keyword.
+    keyword = re.sub(r"[^a-z0-9]+", "", name)
+    for running in get_running_process_names():
+        running_key = re.sub(r"[^a-z0-9]+", "", running.lower())
+        if keyword and keyword in running_key and running not in candidates:
+            candidates.append(running)
+
+    try:
+        closed_any = close_process_candidates(candidates)
+        if closed_any:
+            return f"Closed {name}."
+        return f"{name} was not running."
+    except Exception as error:
+        return f"Failed to close {name}: {error}"
+
+
+def get_start_menu_roots():
+    """Return Start Menu program folders that contain installed app shortcuts."""
+    roots = []
+    appdata = os.getenv("APPDATA")
+    program_data = os.getenv("PROGRAMDATA")
+    if appdata:
+        roots.append(Path(appdata) / r"Microsoft\Windows\Start Menu\Programs")
+    if program_data:
+        roots.append(Path(program_data) / r"Microsoft\Windows\Start Menu\Programs")
+    return [r for r in roots if r.exists()]
+
+
+def normalize_app_key(name):
+    """Normalize app names for matching."""
+    return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+
+
+def build_app_index():
+    """
+    Build a searchable app index from:
+    - Start Menu .lnk/.url entries
+    - Top-level .exe files in Program Files directories
+    """
+    index = {}
+
+    # Start Menu shortcuts are the most reliable installed-app launch points.
+    for root in get_start_menu_roots():
+        for current_root, _, files in os.walk(root):
+            for file in files:
+                if not (file.lower().endswith(".lnk") or file.lower().endswith(".url") or file.lower().endswith(".exe")):
+                    continue
+                full_path = str(Path(current_root) / file)
+                app_name = Path(file).stem
+                key = normalize_app_key(app_name)
+                if key and key not in index:
+                    index[key] = {"name": app_name, "path": full_path}
+
+    # Add common Program Files executables (limited depth for speed).
+    for env_key in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.getenv(env_key)
+        if not base:
+            continue
+        base_path = Path(base)
+        if not base_path.exists():
+            continue
+        try:
+            for vendor_dir in base_path.iterdir():
+                if not vendor_dir.is_dir():
+                    continue
+                # Check top-level and one nested level for app .exe launchers.
+                candidates = []
+                candidates.extend(vendor_dir.glob("*.exe"))
+                for sub in vendor_dir.iterdir():
+                    if sub.is_dir():
+                        candidates.extend(sub.glob("*.exe"))
+
+                for exe in candidates:
+                    app_name = exe.stem
+                    key = normalize_app_key(app_name)
+                    if key and key not in index:
+                        index[key] = {"name": app_name, "path": str(exe)}
+        except Exception:
+            continue
+
+    return index
+
+
+def get_app_index():
+    """Get cached app index; build once per session."""
+    global APP_INDEX_CACHE
+    if APP_INDEX_CACHE is None:
+        APP_INDEX_CACHE = build_app_index()
+    return APP_INDEX_CACHE
+
+
+def find_installed_app(app_name):
+    """Find best installed app match by exact/partial/fuzzy matching."""
+    query = normalize_app_key(app_name or "")
+    if not query:
+        return None
+
+    index = get_app_index()
+    if not index:
+        return None
+
+    # Exact match first.
+    if query in index:
+        return index[query]
+
+    # Partial contains match.
+    for key, value in index.items():
+        if query in key or key in query:
+            return value
+
+    # Fuzzy fallback.
+    choices = list(index.keys())
+    best = difflib.get_close_matches(query, choices, n=1, cutoff=0.72)
+    if best:
+        return index[best[0]]
+    return None
+
+
+def open_installed_app(app_name):
+    """Open an installed app from indexed app shortcuts/executables."""
+    match = find_installed_app(app_name)
+    if not match:
+        return f"I could not find an installed app named {app_name}."
+
+    try:
+        os.startfile(match["path"])
+        return f"Opening {match['name']}."
+    except Exception as error:
+        return f"Failed to open {match['name']}: {error}"
+
+
+def list_installed_apps(query=""):
+    """List installed apps (optionally filtered by query)."""
+    index = get_app_index()
+    if not index:
+        return "I could not find installed apps on this system."
+
+    apps = sorted(index.values(), key=lambda x: x["name"].lower())
+    if query:
+        q = normalize_app_key(query)
+        filtered = []
+        for app in apps:
+            key = normalize_app_key(app["name"])
+            if q in key:
+                filtered.append(app)
+        apps = filtered
+
+    if not apps:
+        return "No installed apps matched your query."
+
+    names = [a["name"] for a in apps[:MAX_APP_LIST_RESULTS]]
+    return "Installed apps: " + ", ".join(names)
+
+
+def tell_time():
+    """Tool: report current system time."""
+    current_time = datetime.datetime.now().strftime("%I:%M %p")
+    return f"The current time is {current_time}."
+
+
+def get_search_roots():
+    """
+    Build file-search roots across common user folders and available drives.
+    This allows Kimi to find files beyond the project folder.
+    """
+    roots = []
+    home = Path.home()
+    common_dirs = [
+        home,
+        home / "Desktop",
+        home / "Documents",
+        home / "Downloads",
+        home / "Pictures",
+        home / "Videos",
+    ]
+    for d in common_dirs:
+        if d.exists():
+            roots.append(d)
+
+    # Include existing Windows drive roots (C:, D:, E:, ...).
+    for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+        drive = Path(f"{letter}:\\")
+        if drive.exists():
+            roots.append(drive)
+
+    # Deduplicate while preserving order.
+    unique = []
+    seen = set()
+    for root in roots:
+        key = str(root).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return unique
+
+
+def find_files(file_query, limit=MAX_FILE_SEARCH_RESULTS):
+    """
+    Search for files by partial name across configured roots.
+    Returns a list of absolute file paths.
+    """
+    query = (file_query or "").strip().lower()
+    if not query:
+        return []
+
+    matches = []
+    roots = get_search_roots()
+    start_time = time.monotonic()
+
+    for root in roots:
+        try:
+            for current_root, dirs, files in os.walk(root):
+                # Avoid long blocking scans.
+                if time.monotonic() - start_time > FILE_SEARCH_TIME_BUDGET_SEC:
+                    return matches
+
+                # Skip heavy or protected folders to reduce errors/latency.
+                lower_root = current_root.lower()
+                if any(skip in lower_root for skip in ("\\windows\\", "\\program files\\windowsapps", "\\$recycle.bin")):
+                    continue
+
+                for filename in files:
+                    if query in filename.lower():
+                        full_path = str(Path(current_root) / filename)
+                        matches.append(full_path)
+                        if len(matches) >= limit:
+                            return matches
+        except Exception:
+            # Continue on permission/access errors.
+            continue
+
+    return matches
+
+
+def open_file(file_path=None, file_name=None):
+    """
+    Tool: open a file by exact path or by searching file name.
+    """
+    if file_path:
+        candidate = Path(os.path.expandvars(os.path.expanduser(file_path.strip().strip('"'))))
+        if candidate.exists() and candidate.is_file():
+            os.startfile(str(candidate))
+            return f"Opening file {candidate.name}."
+
+    if file_name:
+        results = find_files(file_name, limit=1)
+        if results:
+            os.startfile(results[0])
+            return f"Opening file {Path(results[0]).name}."
+        return f"I could not find a file matching {file_name}."
+
+    return "Please provide a file path or file name."
+
+
+def find_file(file_name):
+    """
+    Tool: search for file matches and return short result list.
+    """
+    results = find_files(file_name, limit=5)
+    if not results:
+        return f"No files found for {file_name}."
+    names = [Path(p).name for p in results]
+    return "Found files: " + ", ".join(names)
+
+
+# Tool registry maps AI-callable names to python implementations.
+TOOL_REGISTRY = {
+    "open_youtube": {
+        "function": open_youtube,
+        "description": "opens YouTube in browser",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    "search_youtube": {
+        "function": search_youtube,
+        "description": "searches YouTube for a query",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The YouTube search query."}
+            },
+            "required": ["query"],
+        },
+    },
+    "play_youtube": {
+        "function": play_youtube,
+        "description": "plays the first matching YouTube video for a query",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What to play on YouTube."}
+            },
+            "required": ["query"],
+        },
+    },
+    "open_brave": {
+        "function": open_brave,
+        "description": "opens Brave browser",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    "open_whatsapp": {
+        "function": open_whatsapp,
+        "description": "opens WhatsApp desktop app",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    "open_file_manager": {
+        "function": open_file_manager,
+        "description": "opens Windows File Explorer",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    "open_application": {
+        "function": open_application,
+        "description": "opens a desktop application by app name",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "app_name": {"type": "string", "description": "Application name to open."}
+            },
+            "required": ["app_name"],
+        },
+    },
+    "open_installed_app": {
+        "function": open_installed_app,
+        "description": "opens an installed application by name from indexed app list",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "app_name": {"type": "string", "description": "Installed app name to open."}
+            },
+            "required": ["app_name"],
+        },
+    },
+    "close_application": {
+        "function": close_application,
+        "description": "closes a desktop application by app name",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "app_name": {"type": "string", "description": "Application name to close."}
+            },
+            "required": ["app_name"],
+        },
+    },
+    "list_installed_apps": {
+        "function": list_installed_apps,
+        "description": "lists installed applications, optionally filtered by query",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Optional search text for app names."}
+            },
+            "required": [],
+        },
+    },
+    "open_file": {
+        "function": open_file,
+        "description": "opens a file by absolute path or by searching file name",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Absolute or user-relative file path."},
+                "file_name": {"type": "string", "description": "File name or partial name to search."},
+            },
+            "required": [],
+        },
+    },
+    "find_file": {
+        "function": find_file,
+        "description": "searches and lists matching files by name",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file_name": {"type": "string", "description": "File name or partial file name."}
+            },
+            "required": ["file_name"],
+        },
+    },
+    "open_browser": {
+        "function": open_browser,
+        "description": "opens Google Chrome or default browser",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    "close_browser": {
+        "function": close_browser,
+        "description": "closes Google Chrome browser windows",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    "tell_time": {
+        "function": tell_time,
+        "description": "tells current local system time",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+
+def get_tool_schemas():
+    """
+    Build OpenAI/Groq-compatible tool schema list from TOOL_REGISTRY.
+    This is sent to the model so it can choose tools dynamically.
+    """
+    schemas = []
+    for name, spec in TOOL_REGISTRY.items():
+        schemas.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": spec["description"],
+                    "parameters": spec["parameters"],
+                },
+            }
+        )
+    return schemas
+
+
+def run_model_completion(client, messages, tools=None):
+    """
+    Run model completion with fallback model chain.
+    Optional `tools` enables tool/function-calling behavior.
+    """
+    preferred_model = os.getenv("KIMI_MODEL", DEFAULT_MODEL)
+    candidate_models = [preferred_model] + [m for m in FALLBACK_MODELS if m != preferred_model]
+
+    for model in candidate_models:
+        try:
+            kwargs = {"model": model, "messages": messages}
+            if tools is not None:
+                kwargs["tools"] = tools
+                kwargs["tool_choice"] = "auto"
+            return client.chat.completions.create(**kwargs)
+        except Exception as model_error:
+            print(f"Groq model failed ({model}): {model_error}")
+            continue
+
+    return None
+
+
+def execute_tool_call(tool_call):
+    """
+    Execute one AI-requested tool call from TOOL_REGISTRY.
+    Returns string output to send back to the model/user.
+    """
+    tool_name = tool_call.function.name
+    spec = TOOL_REGISTRY.get(tool_name)
+    if not spec:
+        return f"Tool error: unknown tool '{tool_name}'."
+
+    try:
+        raw_args = tool_call.function.arguments or "{}"
+        parsed_args = json.loads(raw_args)
+        if not isinstance(parsed_args, dict):
+            parsed_args = {}
+    except json.JSONDecodeError:
+        parsed_args = {}
+
+    try:
+        tool_result = spec["function"](**parsed_args)
+        return str(tool_result)
+    except TypeError:
+        return f"Tool error: invalid arguments for '{tool_name}'."
+    except Exception as error:
+        return f"Tool error while running '{tool_name}': {error}"
+
+
+def execute_tool_by_name(tool_name, args=None):
+    """
+    Execute a tool directly by registry name.
+    Useful as a safety fallback when model outputs malformed function text.
+    """
+    spec = TOOL_REGISTRY.get(tool_name)
+    if not spec:
+        return f"Tool error: unknown tool '{tool_name}'."
+
+    payload = args or {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    try:
+        return str(spec["function"](**payload))
+    except TypeError:
+        return f"Tool error: invalid arguments for '{tool_name}'."
+    except Exception as error:
+        return f"Tool error while running '{tool_name}': {error}"
+
+
+def try_execute_embedded_function_text(text):
+    """
+    Parse malformed model outputs like:
+    'function=close_browser></function>'
+    and execute the referenced tool instead of speaking raw markup.
+    """
+    if not text:
+        return None
+
+    match = re.search(r"function\s*=\s*([a-zA-Z_][a-zA-Z0-9_]*)", text)
+    if not match:
+        return None
+
+    tool_name = match.group(1).strip()
+    return execute_tool_by_name(tool_name, {})
+
+
+def split_multi_commands(command):
+    """
+    Split one spoken sentence into sequential sub-commands.
+    Example: "open youtube and play something" ->
+    ["open youtube", "play something"].
+    """
+    text = command.strip()
+    if not text:
+        return []
+
+    parts = re.split(r"\s+(?:and then|and|then)\s+", text, flags=re.IGNORECASE)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def normalize_subcommand(subcommand):
+    """
+    Normalize ambiguous follow-up phrases for better tool decisions.
+    Example: "play something" -> "search youtube random video".
+    """
+    text = subcommand.strip().lower()
+    if re.search(r"\bplay\s+(something|anything|a video|video)\b", text):
+        return "play youtube random video"
+    return subcommand
+
+
+def extract_video_query(command):
+    """
+    Extract user-friendly video query from play/show phrases.
+    Returns None when no media-style intent is detected.
+    """
+    text = command.strip().lower()
+    if not text:
+        return None
+
+    media_words = {"play", "show", "video", "videos", "youtube", "on", "me", "any", "a"}
+    if "play" not in text and "show" not in text:
+        return None
+    if "video" not in text and "youtube" not in text:
+        return None
+
+    tokens = re.findall(r"[a-z0-9']+", text)
+    cleaned = [t for t in tokens if t not in media_words]
+    query = " ".join(cleaned).strip()
+    return query or "random video"
+
+
+def try_local_quick_actions(command):
+    """
+    Reliability layer for high-frequency actions.
+    This runs before AI to avoid tool-call model quirks on simple commands.
+    Returns tuple: (handled: bool, should_continue: bool)
+    """
+    text = command.lower().strip()
+
+    if "open youtube" in text:
+        reply = open_youtube()
+        speak(reply)
+        add_to_history("user", command)
+        add_to_history("assistant", reply)
+        return True, True
+
+    if "open brave" in text or "launch brave" in text:
+        reply = open_brave()
+        speak(reply)
+        add_to_history("user", command)
+        add_to_history("assistant", reply)
+        return True, True
+
+    if "open whatsapp" in text or "launch whatsapp" in text or "start whatsapp" in text:
+        reply = open_whatsapp()
+        speak(reply)
+        add_to_history("user", command)
+        add_to_history("assistant", reply)
+        return True, True
+
+    if "open file manager" in text or "open file explorer" in text or "open explorer" in text:
+        reply = open_file_manager()
+        speak(reply)
+        add_to_history("user", command)
+        add_to_history("assistant", reply)
+        return True, True
+
+    list_apps_match = re.search(r"\b(?:list|show)\s+(?:installed\s+)?apps\b", text)
+    if list_apps_match:
+        reply = list_installed_apps()
+        speak(reply)
+        add_to_history("user", command)
+        add_to_history("assistant", reply)
+        return True, True
+
+    if "close youtube" in text or "close browser" in text or "close chrome" in text:
+        reply = close_browser()
+        speak(reply)
+        add_to_history("user", command)
+        add_to_history("assistant", reply)
+        return True, True
+
+    close_match = re.search(r"\b(?:close|quit|exit)\s+([a-zA-Z0-9][a-zA-Z0-9\s._-]{1,40})\b", text)
+    if close_match:
+        app_name = close_match.group(1).strip()
+        # Prevent collision with assistant shutdown command.
+        if app_name not in {"assistant", "kimi"}:
+            reply = close_application(app_name)
+            speak(reply)
+            add_to_history("user", command)
+            add_to_history("assistant", reply)
+            return True, True
+
+    # File open by explicit path in quotes.
+    quoted_path_match = re.search(r'"([a-zA-Z]:\\[^"]+)"', command)
+    if quoted_path_match:
+        reply = open_file(file_path=quoted_path_match.group(1))
+        speak(reply)
+        add_to_history("user", command)
+        add_to_history("assistant", reply)
+        return True, True
+
+    # File open by name: "open file resume.pdf"
+    file_name_match = re.search(r"\bopen\s+file\s+(.+)$", text)
+    if file_name_match:
+        file_name = file_name_match.group(1).strip()
+        reply = open_file(file_name=file_name)
+        speak(reply)
+        add_to_history("user", command)
+        add_to_history("assistant", reply)
+        return True, True
+
+    # Generic open/launch/start app fallback.
+    app_match = re.search(r"\b(?:open|launch|start)\s+([a-zA-Z0-9][a-zA-Z0-9\s._-]{1,40})\b", text)
+    if app_match:
+        app_name = app_match.group(1).strip()
+        # Skip explicit youtube play/search phrases already handled elsewhere.
+        if "youtube" not in app_name or app_name in {"youtube app"}:
+            reply = open_installed_app(app_name)
+            if reply.lower().startswith("i could not find an installed app"):
+                reply = open_application(app_name)
+            speak(reply)
+            add_to_history("user", command)
+            add_to_history("assistant", reply)
+            return True, True
+
+    video_query = extract_video_query(command)
+    if video_query is not None:
+        reply = play_youtube(video_query)
+        speak(reply)
+        add_to_history("user", command)
+        add_to_history("assistant", reply)
+        return True, True
+
+    return False, True
+
+
+def listen(retries=MAX_LISTEN_RETRIES):
+    """
+    Listen to microphone input and convert speech to text.
+    Speech improvements:
+    - Ambient noise calibration per attempt
+    - Retry up to `retries` times
+    - Better timeout handling for short pauses
+    Returns recognized text in lowercase, or empty string if recognition fails.
+    """
+    recognizer = sr.Recognizer()
+    for attempt in range(1, retries + 1):
+        try:
+            with sr.Microphone() as source:
+                print("Listening...")
+                # Noise calibration helps with fans/background speech.
+                recognizer.adjust_for_ambient_noise(source, duration=0.7)
+                audio = recognizer.listen(source, timeout=6, phrase_time_limit=10)
+
+            print("Recognizing...")
+            command = recognizer.recognize_google(audio)
+            command = command.lower().strip()
+            print(f"You said: {command}")
+            return command
+
+        except sr.WaitTimeoutError:
+            print(f"No speech detected (attempt {attempt}/{retries}).")
+            continue
+        except sr.UnknownValueError:
+            print(f"Speech unclear (attempt {attempt}/{retries}).")
+            continue
+        except sr.RequestError:
+            # Network/API issue for speech recognition service.
+            print("Speech service is unavailable. Check internet connection.")
+            speak("I am having trouble connecting to speech service.")
+            return ""
+        except OSError:
+            # Microphone/device issue.
+            print("Microphone not found or not accessible.")
+            speak("I cannot access the microphone.")
+            return ""
+        except Exception as error:
+            # Generic safeguard for unexpected issues.
+            print(f"Unexpected listen error: {error}")
+            return ""
+
+    return ""
+
+
+def open_chrome():
+    """
+    Try to open Google Chrome directly on Windows.
+    If Chrome path is not found, open Google in default browser.
+    """
+    chrome_paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ]
+
+    for path in chrome_paths:
+        if os.path.exists(path):
+            os.startfile(path)
+            return "Opening Google Chrome."
+
+    # Fallback if Chrome executable is not found.
+    webbrowser.open("https://www.google.com")
+    return "Chrome was not found, opening Google in your default browser."
+
+
+def get_ai_response(prompt):
+    """
+    Send user prompt to Groq model and return generated text response.
+    Uses environment variables for safety:
+    - GROQ_API_KEY (required)
+    - KIMI_MODEL (optional, default: llama-3.1-8b-instant)
+    """
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        return (
+            "I cannot access AI right now because GROQ_API_KEY is not set. "
+            "Please configure your API key."
+        )
+
+    try:
+        client = Groq(api_key=api_key)
+        system_message = (
+            "You are Kimi, a personal AI assistant that can control the user's computer, "
+            "open applications, and perform tasks. "
+            "You have tools to perform actions; use them whenever relevant. "
+            "Follow the user's instructions exactly and prioritize direct execution. "
+            "Do NOT say you cannot open a browser or perform supported actions. "
+            "Do NOT act like a limited chatbot. "
+            "Be concise and helpful. "
+            "Keep replies short unless the user asks for detailed explanation. "
+            "Do not add extra suggestions unless asked. "
+            "Assume external actions can be executed by the assistant system. "
+            "Use user details only when relevant, and do not invent facts. "
+            f"{build_memory_context()}"
+        )
+
+        messages = [{"role": "system", "content": system_message}]
+        messages.extend(conversation_history)
+        messages.append({"role": "user", "content": prompt})
+
+        tools = get_tool_schemas()
+        first_response = run_model_completion(client, messages, tools=tools)
+        if not first_response or not first_response.choices:
+            return "I could not generate a response right now."
+
+        assistant_message = first_response.choices[0].message
+        tool_calls = getattr(assistant_message, "tool_calls", None) or []
+
+        # If model decided to call one or more tools, run them dynamically.
+        if tool_calls:
+            executed_tool_results = []
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_message.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments or "{}",
+                            },
+                        }
+                        for tc in tool_calls
+                    ],
+                }
+            )
+
+            for tool_call in tool_calls:
+                tool_result = execute_tool_call(tool_call)
+                executed_tool_results.append(tool_result)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": tool_result,
+                    }
+                )
+
+            final_response = run_model_completion(client, messages, tools=tools)
+            if final_response and final_response.choices and final_response.choices[0].message:
+                final_text = (final_response.choices[0].message.content or "").strip()
+                if not final_text:
+                    final_text = " Then ".join(executed_tool_results) if executed_tool_results else "Action completed."
+                if final_text.lower() in {"done", "done.", "completed", "complete."}:
+                    final_text = " Then ".join(executed_tool_results) if executed_tool_results else "Action completed."
+                add_to_history("user", prompt)
+                add_to_history("assistant", final_text)
+                return final_text
+
+            add_to_history("user", prompt)
+            fallback_text = " Then ".join(executed_tool_results) if executed_tool_results else "Action completed."
+            add_to_history("assistant", fallback_text)
+            return fallback_text
+
+        # No tool call needed: return direct assistant text.
+        direct_text = (assistant_message.content or "").strip()
+        embedded_tool_result = try_execute_embedded_function_text(direct_text)
+        if embedded_tool_result is not None:
+            add_to_history("user", prompt)
+            add_to_history("assistant", embedded_tool_result)
+            return embedded_tool_result
+
+        if direct_text:
+            add_to_history("user", prompt)
+            add_to_history("assistant", direct_text)
+            return direct_text
+
+        return "I received a response, but could not read it properly."
+
+    except Exception as error:
+        print(f"Groq API error: {error}")
+        return "I am having trouble reaching the AI service right now."
+
+
+def process_command(command):
+    """
+    Process recognized command text and perform matching action.
+    Returns False if user asks to stop, otherwise True.
+    """
+    if not command:
+        return True
+
+    # Keep local shutdown command explicit for reliable loop control.
+    if command.lower().strip() in EXIT_KEYWORDS:
+        reply = "Goodbye. Shutting down Kimi."
+        speak(reply)
+        add_to_history("user", command)
+        add_to_history("assistant", reply)
+        return False
+
+    # Update lightweight personalization memory from user text.
+    update_memory(command)
+
+    # Reliability shortcut for common media requests (play/open YouTube).
+    handled, should_continue = try_local_quick_actions(command)
+    if handled:
+        return should_continue
+
+    # Multi-step command handling: split on "and/then" and execute sequentially.
+    subcommands = split_multi_commands(command)
+    if not subcommands:
+        speak("Can you repeat that?")
+        return True
+
+    step_responses = []
+    for raw_step in subcommands:
+        step = normalize_subcommand(raw_step)
+        if not step:
+            continue
+        ai_reply = get_ai_response(step)
+        step_responses.append(ai_reply)
+
+    if not step_responses:
+        speak("Can you repeat that?")
+        return True
+
+    if len(step_responses) == 1:
+        speak(step_responses[0])
+    else:
+        # Multi-step summary keeps response descriptive and not just "Done".
+        speak(" Then ".join(step_responses))
+
+    return True
+
+
+def main():
+    """
+    Run Kimi in a continuous listening loop without wake-word requirement.
+    Every recognized instruction is processed directly.
+    """
+    speak("Hello, I am Kimi. I am listening.")
+
+    while True:
+        heard_text = listen()
+        if not heard_text:
+            speak("Can you repeat that?")
+            continue
+
+        should_continue = process_command(heard_text)
+        if not should_continue:
+            break
+
+
+if __name__ == "__main__":
+    main()
