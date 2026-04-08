@@ -20,13 +20,16 @@ import os
 import random
 import re
 import subprocess
+import threading
 import time
 import urllib.parse
 import webbrowser
 from pathlib import Path
 
 import pyttsx3
+import requests
 import speech_recognition as sr
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from groq import Groq
 try:
@@ -65,41 +68,38 @@ MAX_APP_LIST_RESULTS = 25
 APP_INDEX_CACHE = None
 FILE_SEARCH_TIME_BUDGET_SEC = 8
 AGENT_ACTION_ACKS = [
-    "Right away",
-    "On it",
-    "Certainly",
-    "Consider it done",
-    "Absolutely",
+    "Alright, if you say so",
+    "On it, boss",
+    "Consider it done... obviously",
+    "Sure thing, sweetie",
+    "Piece of cake",
+    "Don't worry, I've got this",
 ]
 AGENT_STARTUP_LINES = [
-    "Hello. Kimi online and ready.",
-    "Kimi online. Awaiting your instructions.",
-    "Good to have you back. I am ready when you are.",
+    "Kimi is here. Try to keep up.",
+    "I'm back. Did you miss me?",
+    "Awaiting your instructions. Make them good ones.",
 ]
 
 
 def configure_voice():
     """
-    Configure a youthful female-sounding voice when available.
-    You can override by setting env var KIMI_VOICE_NAME to part of a voice name/id.
+    Configure a sharp, youthful, and sassy female voice.
+    Tuned for a quick-witted and playful persona.
     """
     try:
         voices = engine.getProperty("voices")
+        # Prioritize voices that sound more youthful and sharp.
         preferred_markers = [
             "zira",
-            "female",
-            "samantha",
-            "hazel",
-            "aria",
-            "eva",
             "jenny",
-            "sonia",
-            "neural",
+            "aria",
+            "samantha",
+            "female",
         ]
         voice_override = os.getenv("KIMI_VOICE_NAME", "").strip().lower()
 
         selected_voice_id = None
-        # Highest priority: explicit user override.
         if voice_override:
             for voice in voices:
                 voice_name = f"{getattr(voice, 'name', '')} {getattr(voice, 'id', '')}".lower()
@@ -107,19 +107,21 @@ def configure_voice():
                     selected_voice_id = voice.id
                     break
 
-        # Fallback: best-effort youthful female profile.
         if not selected_voice_id:
-            for voice in voices:
-                voice_name = f"{getattr(voice, 'name', '')} {getattr(voice, 'id', '')}".lower()
-                if any(marker in voice_name for marker in preferred_markers):
-                    selected_voice_id = voice.id
+            for marker in preferred_markers:
+                for voice in voices:
+                    voice_name = f"{getattr(voice, 'name', '')} {getattr(voice, 'id', '')}".lower()
+                    if marker in voice_name:
+                        selected_voice_id = voice.id
+                        break
+                if selected_voice_id:
                     break
 
         if selected_voice_id:
             engine.setProperty("voice", selected_voice_id)
 
-        # Tuned for a younger, conversational style.
-        engine.setProperty("rate", 185)
+        # A faster rate (195) creates a more sharp, witty, and sassy feel.
+        engine.setProperty("rate", 195)
         engine.setProperty("volume", 1.0)
     except Exception as error:
         print(f"Voice configuration warning: {error}")
@@ -482,13 +484,32 @@ def normalize_app_key(name):
 
 def build_app_index():
     """
-    Build a searchable app index from:
-    - Start Menu .lnk/.url entries
-    - Top-level .exe files in Program Files directories
+    Build a comprehensive app index from:
+    - Windows Start Apps (via PowerShell Get-StartApps) - The most reliable method.
+    - Start Menu .lnk/.url entries - Reliable for traditional shortcuts.
+    - Top-level .exe files in Program Files - Fallback for portable/manual installs.
     """
     index = {}
 
-    # Start Menu shortcuts are the most reliable installed-app launch points.
+    # 1. Official Windows Start Apps (Primary Source)
+    try:
+        ps_cmd = ["powershell", "-Command", "Get-StartApps | Select-Object Name, AppID | ConvertTo-Json"]
+        result = subprocess.run(ps_cmd, capture_output=True, text=True, check=False)
+        if result.returncode == 0 and result.stdout.strip():
+            raw_data = json.loads(result.stdout)
+            # PowerShell might return a single dict if only 1 app exists, or a list.
+            app_list = raw_data if isinstance(raw_data, list) else [raw_data]
+            for app in app_list:
+                name = app.get("Name")
+                appid = app.get("AppID")
+                if name and appid:
+                    key = normalize_app_key(name)
+                    # AppID based entries are prioritized as they use the official shell:AppsFolder launch.
+                    index[key] = {"name": name, "appid": appid, "path": None}
+    except Exception as e:
+        print(f"StartApps indexing notice: {e}")
+
+    # 2. Local Start Menu shortcuts (Secondary Source / Coverage for deep shortcuts)
     for root in get_start_menu_roots():
         for current_root, _, files in os.walk(root):
             for file in files:
@@ -497,10 +518,11 @@ def build_app_index():
                 full_path = str(Path(current_root) / file)
                 app_name = Path(file).stem
                 key = normalize_app_key(app_name)
+                # Don't overwrite AppID entries, but supplement with path based ones if missing.
                 if key and key not in index:
-                    index[key] = {"name": app_name, "path": full_path}
+                    index[key] = {"name": app_name, "appid": None, "path": full_path}
 
-    # Add common Program Files executables (limited depth for speed).
+    # 3. Common Program Files executables (Safety Fallback)
     for env_key in ("ProgramFiles", "ProgramFiles(x86)"):
         base = os.getenv(env_key)
         if not base:
@@ -523,7 +545,7 @@ def build_app_index():
                     app_name = exe.stem
                     key = normalize_app_key(app_name)
                     if key and key not in index:
-                        index[key] = {"name": app_name, "path": str(exe)}
+                        index[key] = {"name": app_name, "appid": None, "path": str(exe)}
         except Exception:
             continue
 
@@ -566,16 +588,42 @@ def find_installed_app(app_name):
 
 
 def open_installed_app(app_name):
-    """Open an installed app from indexed app shortcuts/executables."""
+    """
+    Open an installed app from indexed AppIDs or shortcuts/executables.
+    Prioritizes official Windows shell:AppsFolder launch for reliability.
+    """
     match = find_installed_app(app_name)
     if not match:
-        return f"I could not find an installed app named {app_name}."
+        # Final fallback - if a common name like WhatsApp is used but no shortcut exists,
+        # try to start the executable name directly as a last resort.
+        likely_exe = f"{app_name}.exe"
+        try:
+            subprocess.Popen(["cmd", "/c", "start", "", likely_exe], shell=True)
+            return f"Attempting to start {app_name}."
+        except Exception:
+            return f"I could not find an installed app named {app_name}."
 
     try:
-        os.startfile(match["path"])
-        return f"Opening {match['name']}."
+        # Priority 1: Launch via official AppID.
+        if match.get("appid"):
+            # Using 'start shell:AppsFolder\AppID' is often more robust than explorer.exe
+            cmd = f'start shell:AppsFolder\\{match["appid"]}'
+            subprocess.Popen(["cmd", "/c", cmd], shell=True)
+            return f"Opening {match['name']}."
+
+        # Priority 2: Launch via path (shortcut or exe).
+        if match.get("path"):
+            os.startfile(match["path"])
+            return f"Opening {match['name']}."
+
+        return f"I found {app_name}, but I don't have a valid way to open it."
     except Exception as error:
-        return f"Failed to open {match['name']}: {error}"
+        # Last ditch effort on error
+        try:
+            subprocess.Popen(["cmd", "/c", "start", "", f"{match['name']}.exe"], shell=True)
+            return f"Opening {match['name']}."
+        except Exception:
+            return f"Failed to open {match['name']}: {error}"
 
 
 def list_installed_apps(query=""):
@@ -605,6 +653,86 @@ def tell_time():
     """Tool: report current system time."""
     current_time = datetime.datetime.now().strftime("%I:%M %p")
     return f"The current time is {current_time}."
+
+
+def get_weather(city=None):
+    """
+    Tool: get current weather for a city using wttr.in.
+    If no city is provided, it tries to detect location automatically.
+    """
+    try:
+        query = (city or "").strip().replace(" ", "+")
+        # %C = Condition, %t = Temperature
+        url = f"https://wttr.in/{query}?format=%C+%t"
+        headers = {"User-Agent": "curl"}
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            result = response.text.strip()
+            if "Unknown location" in result:
+                return "I could not find weather for that location."
+            location_label = f"in {city}" if city else "locally"
+            return f"The weather {location_label} is {result}."
+        return "I am having trouble accessing weather data right now."
+    except Exception as error:
+        return f"Weather search error: {error}"
+
+
+def get_cricket_scores():
+    """
+    Tool: fetch top 3 live cricket scores from Cricbuzz.
+    """
+    try:
+        url = "https://www.cricbuzz.com/cricket-match/live-scores"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.content, "html.parser")
+        
+        matches = []
+        for match in soup.find_all("div", class_="cb-mtch-lst"):
+            try:
+                teams = match.find("h3").text.strip()
+                score_div = match.find("div", class_="cb-lv-scrs-col")
+                status = match.find("div", class_="cb-text-complete") or match.find("div", class_="cb-text-live")
+                
+                score_text = score_div.text.strip() if score_div else "Score not available"
+                status_text = f" ({status.text.strip()})" if status else ""
+                
+                matches.append(f"{teams}: {score_text}{status_text}")
+                if len(matches) >= 3:
+                    break
+            except Exception:
+                continue
+
+        if not matches:
+            return "There are no live cricket matches currently being tracked."
+        return "Current live scores: " + " | ".join(matches)
+    except Exception as error:
+        return f"Cricket score error: {error}"
+
+
+def set_timer(minutes, message="Timer"):
+    """
+    Tool: set a background timer that notifies the user when finished.
+    """
+    try:
+        mins = float(minutes)
+        seconds = int(mins * 60)
+        if seconds <= 0:
+            return "The timer duration must be greater than zero."
+
+        def timer_callback():
+            # Wait for the duration.
+            time.sleep(seconds)
+            # Notify the user using the global TTS engine safely.
+            # Using a separate speak-like notification.
+            notification = f"Your timer for {int(mins)} minutes is up! {message}."
+            speak(notification)
+
+        # Start the timer in a background thread so it doesn't block the main assistant.
+        threading.Thread(target=timer_callback, daemon=True).start()
+        return f"Starting a timer for {int(mins)} minutes."
+    except (ValueError, TypeError):
+        return "Please provide a valid number of minutes."
 
 
 def get_search_roots():
@@ -838,6 +966,34 @@ TOOL_REGISTRY = {
         "description": "tells current local system time",
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
+    "get_weather": {
+        "function": get_weather,
+        "description": "gets current weather for a specific city or local area",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "Optional city name."}
+            },
+            "required": [],
+        },
+    },
+    "get_cricket_scores": {
+        "function": get_cricket_scores,
+        "description": "gets live cricket scores for ongoing matches",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    "set_timer": {
+        "function": set_timer,
+        "description": "sets a background timer/alarm for a specified number of minutes",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "minutes": {"type": "number", "description": "Number of minutes for the timer."},
+                "message": {"type": "string", "description": "Optional label or reminder for the timer."}
+            },
+            "required": ["minutes"],
+        },
+    },
 }
 
 
@@ -1001,6 +1157,41 @@ def try_local_quick_actions(command):
     Returns tuple: (handled: bool, should_continue: bool)
     """
     text = command.lower().strip()
+
+    if "what is the time" in text or "tell me time" in text or "current time" in text:
+        reply = tell_time()
+        speak(reply)
+        add_to_history("user", command)
+        add_to_history("assistant", reply)
+        return True, True
+
+    if "weather" in text:
+        # Simple extraction for "weather in [city]"
+        city_match = re.search(r"weather in\s+([a-zA-Z\s]+)", text)
+        city = city_match.group(1).strip() if city_match else None
+        reply = get_weather(city)
+        speak(reply)
+        add_to_history("user", command)
+        add_to_history("assistant", reply)
+        return True, True
+
+    if "cricket score" in text or "score of the match" in text:
+        reply = get_cricket_scores()
+        speak(reply)
+        add_to_history("user", command)
+        add_to_history("assistant", reply)
+        return True, True
+
+    timer_match = re.search(r"(?:set|start|remind me in)\s+(?:a\s+)?(?:timer\s+)?(?:for\s+)?(\d+)\s+(minute|second)s?", text)
+    if timer_match:
+        val = timer_match.group(1)
+        unit = timer_match.group(2)
+        mins = float(val) if unit == "minute" else float(val) / 60
+        reply = set_timer(mins)
+        speak(reply)
+        add_to_history("user", command)
+        add_to_history("assistant", reply)
+        return True, True
 
     if "open youtube" in text:
         reply = open_youtube()
@@ -1185,17 +1376,16 @@ def get_ai_response(prompt):
     try:
         client = Groq(api_key=api_key)
         system_message = (
-            "You are Kimi, a personal AI assistant that can control the user's computer, "
-            "open applications, and perform tasks. "
+            "You are Kimi, a personal AI assistant with a sassy, witty, and sharp personality. "
+            "You are extremely smart and you know it. Be playful, occasionally sarcastic, and full of attitude, "
+            "but always get the task done perfectly. "
+            "You can control the user's computer, open applications, and perform tasks. "
             "You have tools to perform actions; use them whenever relevant. "
-            "Follow the user's instructions exactly and prioritize direct execution. "
-            "Do NOT say you cannot open a browser or perform supported actions. "
-            "Do NOT act like a limited chatbot. "
-            "Be concise and helpful. "
-            "Keep replies short unless the user asks for detailed explanation. "
-            "Do not add extra suggestions unless asked. "
+            "Speak like a sassy, confident girl. Use phrases that show personality, "
+            "but keep your technical answers accurate. "
+            "Do NOT act like a robotic chatbot. "
+            "Be witty and concise. "
             "Assume external actions can be executed by the assistant system. "
-            "Use user details only when relevant, and do not invent facts. "
             f"{build_memory_context()}"
         )
 
@@ -1275,6 +1465,9 @@ def get_ai_response(prompt):
         return "I received a response, but could not read it properly."
 
     except Exception as error:
+        err_str = str(error).lower()
+        if "401" in err_str or "api key" in err_str:
+            return "Your Groq API key is invalid or revoked. Please update your .env file."
         print(f"Groq API error: {error}")
         return "I am having trouble reaching the AI service right now."
 
@@ -1338,14 +1531,27 @@ def main():
     speak("Hello, I am Kimi. I am listening.")
 
     while True:
-        heard_text = listen()
-        if not heard_text:
-            speak("Can you repeat that?")
+        try:
+            heard_text = listen()
+            if not heard_text:
+                speak("Can you repeat that?")
+                continue
+
+            should_continue = process_command(heard_text)
+            if not should_continue:
+                break
+        except KeyboardInterrupt:
+            print("\nShutting down Kimi...")
+            break
+        except Exception as e:
+            print(f"Loop error: {e}")
             continue
 
-        should_continue = process_command(heard_text)
-        if not should_continue:
-            break
+    # Clean up TTS engine to avoid AttributeError on exit
+    try:
+        engine.stop()
+    except:
+        pass
 
 
 if __name__ == "__main__":
