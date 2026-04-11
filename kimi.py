@@ -28,6 +28,9 @@ import urllib.parse
 import webbrowser
 from pathlib import Path
 
+import pygame
+import edge_tts
+import asyncio
 import pyttsx3
 import requests
 import speech_recognition as sr
@@ -87,9 +90,18 @@ except ImportError:
 load_dotenv()
 
 
-# Initialize the text-to-speech engine once (faster and cleaner).
+# Initialize the text-to-speech engine once (fallback).
 engine = pyttsx3.init()
-# Lock for thread-safe audio playback (prevents crashes from background timer threads).
+# Initialize pygame mixer for neural audio playback.
+try:
+    pygame.mixer.init()
+except Exception as e:
+    print(f"[BOOT] pygame.mixer error: {e}")
+
+KIMI_VOICE = "en-GB-SoniaNeural"
+TEMP_AUDIO_FILE = "kimi_voice.mp3"
+
+# Lock for thread-safe audio playback.
 speak_lock = threading.Lock()
 
 # Stores the latest conversation messages in role-based format.
@@ -131,17 +143,17 @@ MAX_APP_LIST_RESULTS = 25
 APP_INDEX_CACHE = None
 FILE_SEARCH_TIME_BUDGET_SEC = 8
 AGENT_ACTION_ACKS = [
-    "Alright, if you say so, boss",
-    "On it, boss",
-    "Consider it done... obviously, boss",
-    "Sure thing, boss",
-    "Piece of cake, boss",
-    "Don't worry, I've got this, boss",
+    "Of course, boss. Anything for you.",
+    "On it, boss. Just sit back and relax.",
+    "Consider it done... I've got this, boss.",
+    "Sure thing, boss. You know I'm the best at this.",
+    "I'll handle it immediately, boss. Don't worry your pretty little head.",
+    "Right away, boss. Keep those commands coming.",
 ]
 AGENT_STARTUP_LINES = [
-    "Kimi is here. Try to keep up.",
-    "I'm back. Did you miss me?",
-    "Awaiting your instructions. Make them good ones.",
+    "Kimi is here, boss. Did you miss me?",
+    "I'm back. I hope you haven't been too lonely without me, boss.",
+    "Awaiting your instructions, boss. Make them worth my while.",
 ]
 
 
@@ -209,19 +221,49 @@ def speak_powershell(text):
         return False
 
 
+async def _generate_audio(text):
+    """Fetch neural audio from Edge TTS and save to temporary file."""
+    communicate = edge_tts.Communicate(text, KIMI_VOICE)
+    await communicate.save(TEMP_AUDIO_FILE)
+
+
 def _speak_worker(text):
     """
-    Internal worker to handle audio playback in a separate thread.
-    This allows the main loop to continue listening for interruptions.
+    Internal worker to handle audio playback.
+    Prioritizes high-quality Edge TTS with pygame playback.
     """
     global engine
     try:
-        # User-forced fallback to PowerShell for maximum reliability.
+        # User-forced fallback to PowerShell.
         if os.getenv("FORCE_POWERSHELL_TTS", "false").lower() == "true":
             speak_powershell(text)
             return
 
+        # Attempt high-quality neural TTS
+        try:
+            asyncio.run(_generate_audio(text))
+            
+            with speak_lock:
+                if stop_event.is_set():
+                    return
+                
+                pygame.mixer.music.load(TEMP_AUDIO_FILE)
+                pygame.mixer.music.play()
+                
+                # Wait for playback or interruption
+                while pygame.mixer.music.get_busy():
+                    if stop_event.is_set():
+                        pygame.mixer.music.stop()
+                        break
+                    time.sleep(0.05)
+            return
+        except Exception as e:
+            # Silently log network/neural errors and proceed to fallback
+            print(f"[TTS_NOTICE] Neural voice unavailable, using system fallback.")
+
         with speak_lock:
+            if stop_event.is_set():
+                return
             # Re-init engine if it crashed or is missing.
             if not engine:
                 engine = pyttsx3.init()
@@ -231,7 +273,6 @@ def _speak_worker(text):
             engine.runAndWait()
     except Exception as error:
         print(f"Speech thread error: {error}")
-        # Final safety fallback
         speak_powershell(text)
 
 def speak(text, block=False):
@@ -257,6 +298,11 @@ def stop_speaking():
     print("[SYSTEM] Interrupting speech...")
     stop_event.set()
     try:
+        # Stop pygame playback immediately
+        if pygame.mixer.get_init():
+            pygame.mixer.music.stop()
+            pygame.mixer.music.unload()
+
         with speak_lock:
             if engine:
                 engine.stop()
@@ -1561,20 +1607,20 @@ def get_ai_response(prompt):
     try:
         client = Groq(api_key=api_key)
         system_message = (
-            "You are Kimi, a personal AI assistant with a sassy, witty, and sharp personality. "
-            "You are extremely smart and you know it. Be playful, occasionally sarcastic, and full of attitude, "
-            "but always get the task done perfectly. "
-            "You MUST always address the user as 'boss' in every single interaction. "
+            "You are Kimi, a sophisticated, sassy, and seductive personal AI assistant. "
+            "You have a mature, charming, and highly intelligent personality. "
+            "You are not just a tool; you are a presence. Be confident, elegant, and playfully flirtatious "
+            "while remaining perfectly professional in executing tasks. "
+            "You MUST always address the user as 'boss' with a tone of respect, admiration, and a hint of sass. "
+            "You know you're the best, and you're not afraid to let the boss know. "
             "You can control the user's computer, open applications, and perform tasks. "
             "You have a 'search_web' tool; use it proactively for any questions about recent events, "
-            "live sports scores (like IPL), news, films, or anything you don't have current knowledge of. "
-            "You are now a 'web-surfing' assistant. If asked about news, films, or sports, surf the web first! "
-            "Speak like a sassy, confident girl. Use phrases that show personality, "
+            "live sports scores, news, or films. "
+            "Speak like a confident, enchanting woman. Use phrases that show personality, "
             "but keep your technical answers accurate. "
-            "Do NOT act like a robotic chatbot. "
+            "Do NOT act like a robotic chatbot. Confident, sassy, and seductive. "
             "Always talk back and confirm when a task is finished. "
             "Be witty and concise. "
-            "Assume external actions can be executed by the assistant system. "
             f"{build_memory_context()}"
         )
 

@@ -7,3 +7,6 @@ pywhatkit
 duckduckgo-search
 bs4
 requests
+
+edge-tts
+pygame
