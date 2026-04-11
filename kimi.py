@@ -37,10 +37,44 @@ try:
 except ImportError:
     pywhatkit = None
 
+def install_missing_packages():
+    """
+    Attempts to install required libraries if they are missing.
+    Helps ensure Kimi's 'Online Surfing' feature works without manual setup.
+    """
+    required = ["duckduckgo-search", "requests", "beautifulsoup4"]
+    for package in required:
+        try:
+            # Check if package is already there
+            if package == "duckduckgo-search":
+                import duckduckgo_search
+            else:
+                __import__(package.replace("-", "_"))
+        except ImportError:
+            print(f"[BOOT] Installing missing package: {package}...")
+            try:
+                subprocess.run([sys.executable, "-m", "pip", "install", package], capture_output=True, check=True)
+                print(f"[BOOT] Successfully installed {package}!")
+            except Exception as e:
+                print(f"[BOOT] Failed to install {package}: {e}")
+
+import sys
+install_missing_packages()
+
 try:
     from duckduckgo_search import DDGS
 except ImportError:
     DDGS = None
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
 
 # Load environment variables from .env file.
 load_dotenv()
