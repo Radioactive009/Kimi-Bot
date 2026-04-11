@@ -43,6 +43,8 @@ load_dotenv()
 
 # Initialize the text-to-speech engine once (faster and cleaner).
 engine = pyttsx3.init()
+# Lock for thread-safe audio playback (prevents crashes from background timer threads).
+speak_lock = threading.Lock()
 
 # Stores the latest conversation messages in role-based format.
 # We keep only the last 5 interactions (10 messages: user + assistant).
@@ -134,23 +136,25 @@ def speak(text):
     """
     Convert text to speech and say it out loud.
     Also prints text so user can see assistant responses in terminal.
+    Thread-safe implementation.
     """
     global engine
     print(f"Kimi: {text}")
-    try:
-        engine.say(text)
-        engine.runAndWait()
-    except Exception as error:
-        # Recover TTS engine once if runtime voice playback fails.
-        print(f"TTS error (recovering): {error}")
+    with speak_lock:
         try:
-            engine = pyttsx3.init()
-            configure_voice()
             engine.say(text)
             engine.runAndWait()
-        except Exception as retry_error:
-            # Final fallback: keep terminal output even if speech is unavailable.
-            print(f"TTS recovery failed: {retry_error}")
+        except Exception as error:
+            # Recover TTS engine once if runtime voice playback fails.
+            print(f"TTS error (recovering): {error}")
+            try:
+                engine = pyttsx3.init()
+                configure_voice()
+                engine.say(text)
+                engine.runAndWait()
+            except Exception as retry_error:
+                # Final fallback: keep terminal output even if speech is unavailable.
+                print(f"TTS recovery failed: {retry_error}")
 
 
 def compose_action_reply(text):
@@ -1159,6 +1163,7 @@ def try_local_quick_actions(command):
     text = command.lower().strip()
 
     if "what is the time" in text or "tell me time" in text or "current time" in text:
+        speak("Checking the time for you, boss.")
         reply = f"{tell_time()} Anything else, boss?"
         speak(reply)
         add_to_history("user", command)
@@ -1169,6 +1174,7 @@ def try_local_quick_actions(command):
         # Simple extraction for "weather in [city]"
         city_match = re.search(r"weather in\s+([a-zA-Z\s]+)", text)
         city = city_match.group(1).strip() if city_match else None
+        speak(f"Getting the weather {'in ' + city if city else 'for you'}, boss.")
         reply = f"{get_weather(city)} How's that, boss?"
         speak(reply)
         add_to_history("user", command)
@@ -1176,6 +1182,7 @@ def try_local_quick_actions(command):
         return True, True
 
     if "cricket score" in text or "score of the match" in text:
+        speak("Fetching the latest cricket scores, boss.")
         reply = f"{get_cricket_scores()} Hope your team is winning, boss!"
         speak(reply)
         add_to_history("user", command)
@@ -1187,6 +1194,7 @@ def try_local_quick_actions(command):
         val = timer_match.group(1)
         unit = timer_match.group(2)
         mins = float(val) if unit == "minute" else float(val) / 60
+        speak(f"Setting a timer for {val} {unit}s, boss.")
         reply = f"{set_timer(mins)} I'll let you know when it's done, boss."
         speak(reply)
         add_to_history("user", command)
@@ -1194,35 +1202,36 @@ def try_local_quick_actions(command):
         return True, True
 
     if "open youtube" in text:
-        reply = f"{open_youtube()} There you go, boss."
-        speak(reply)
+        speak("Sure thing boss, opening YouTube.")
+        open_youtube()
         add_to_history("user", command)
-        add_to_history("assistant", reply)
+        add_to_history("assistant", "Opening YouTube, boss.")
         return True, True
 
     if "open brave" in text or "launch brave" in text:
-        reply = f"{open_brave()} Ready for you, boss."
-        speak(reply)
+        speak("Right away boss, launching Brave.")
+        open_brave()
         add_to_history("user", command)
-        add_to_history("assistant", reply)
+        add_to_history("assistant", "Opening Brave browser, boss.")
         return True, True
 
     if "open whatsapp" in text or "launch whatsapp" in text or "start whatsapp" in text:
-        reply = f"{open_whatsapp()} WhatsApp is up, boss."
-        speak(reply)
+        speak("Connecting you to WhatsApp, boss.")
+        open_whatsapp()
         add_to_history("user", command)
-        add_to_history("assistant", reply)
+        add_to_history("assistant", "WhatsApp is open, boss.")
         return True, True
 
     if "open file manager" in text or "open file explorer" in text or "open explorer" in text:
-        reply = f"{open_file_manager()} Exploring files for you, boss."
-        speak(reply)
+        speak("Opening your files, boss.")
+        open_file_manager()
         add_to_history("user", command)
-        add_to_history("assistant", reply)
+        add_to_history("assistant", "Exploring files for you, boss.")
         return True, True
 
     list_apps_match = re.search(r"\b(?:list|show)\s+(?:installed\s+)?apps\b", text)
     if list_apps_match:
+        speak("Listing your installed apps now, boss.")
         reply = f"{list_installed_apps()} Here's the list, boss."
         speak(reply)
         add_to_history("user", command)
@@ -1230,10 +1239,10 @@ def try_local_quick_actions(command):
         return True, True
 
     if "close youtube" in text or "close browser" in text or "close chrome" in text:
-        reply = f"{close_browser()} Browser closed, boss."
-        speak(reply)
+        speak("Closing the browser for you, boss.")
+        close_browser()
         add_to_history("user", command)
-        add_to_history("assistant", reply)
+        add_to_history("assistant", "Browser closed, boss.")
         return True, True
 
     close_match = re.search(r"\b(?:close|quit|exit)\s+([a-zA-Z0-9][a-zA-Z0-9\s._-]{1,40})\b", text)
@@ -1241,6 +1250,7 @@ def try_local_quick_actions(command):
         app_name = close_match.group(1).strip()
         # Prevent collision with assistant shutdown command.
         if app_name not in {"assistant", "kimi"}:
+            speak(f"Closing {app_name}, boss.")
             reply = f"{close_application(app_name)} Done, boss."
             speak(reply)
             add_to_history("user", command)
@@ -1250,7 +1260,9 @@ def try_local_quick_actions(command):
     # File open by explicit path in quotes.
     quoted_path_match = re.search(r'"([a-zA-Z]:\\[^"]+)"', command)
     if quoted_path_match:
-        reply = f"{open_file(file_path=quoted_path_match.group(1))} Open and ready, boss."
+        path = quoted_path_match.group(1)
+        speak(f"Opening the file for you, boss.")
+        reply = f"{open_file(file_path=path)} Open and ready, boss."
         speak(reply)
         add_to_history("user", command)
         add_to_history("assistant", reply)
@@ -1260,6 +1272,7 @@ def try_local_quick_actions(command):
     file_name_match = re.search(r"\bopen\s+file\s+(.+)$", text)
     if file_name_match:
         file_name = file_name_match.group(1).strip()
+        speak(f"Searching for {file_name}, boss.")
         reply = f"{open_file(file_name=file_name)} Found it and opened it, boss."
         speak(reply)
         add_to_history("user", command)
@@ -1272,22 +1285,23 @@ def try_local_quick_actions(command):
         app_name = app_match.group(1).strip()
         # Skip explicit youtube play/search phrases already handled elsewhere.
         if "youtube" not in app_name or app_name in {"youtube app"}:
+            speak(f"Opening {app_name} for you, boss.")
             reply = open_installed_app(app_name)
             if reply.lower().startswith("i could not find an installed app"):
                 reply = open_application(app_name)
-            reply = f"{reply} There you go, boss."
-            speak(reply)
             add_to_history("user", command)
-            add_to_history("assistant", reply)
+            add_to_history("assistant", f"Opening {app_name}, boss.")
             return True, True
 
     video_query = extract_video_query(command)
     if video_query is not None:
-        reply = f"{play_youtube(video_query)} Enjoy the video, boss!"
-        speak(reply)
+        speak(f"Playing {video_query} on YouTube, boss.")
+        play_youtube(video_query)
         add_to_history("user", command)
-        add_to_history("assistant", reply)
+        add_to_history("assistant", f"Enjoy the video, boss!")
         return True, True
+
+    return False, True
 
     return False, True
 
@@ -1321,6 +1335,8 @@ def listen(retries=MAX_LISTEN_RETRIES):
             continue
         except sr.UnknownValueError:
             print(f"Speech unclear (attempt {attempt}/{retries}).")
+            if attempt == retries:
+                speak("I'm sorry boss, I didn't catch that. Could you say it again?")
             continue
         except sr.RequestError:
             # Network/API issue for speech recognition service.
