@@ -102,7 +102,16 @@ FALLBACK_MODELS = [
     "openai/gpt-oss-120b",
 ]
 
-EXIT_KEYWORDS = {"exit", "quit", "stop"}
+EXIT_KEYWORDS = {
+    "exit", "quit", "stop", "kimi stop", "kimi shutdown", "kimi shut down", 
+    "stop speaking", "turn off", "shut down"
+}
+
+# Global events for interruption and shutdown control
+stop_event = threading.Event()
+shutdown_event = threading.Event()
+# To keep track of the background listener stop function
+stop_listening_callback = None
 MAX_LISTEN_RETRIES = 3
 MAX_FILE_SEARCH_RESULTS = 10
 MAX_APP_LIST_RESULTS = 25
@@ -187,38 +196,65 @@ def speak_powershell(text):
         return False
 
 
-def speak(text):
+def _speak_worker(text):
     """
-    Convert text to speech and say it out loud.
-    Also prints text so user can see assistant responses in terminal.
-    Uses pyttsx3 with a PowerShell fallback for maximum reliability.
+    Internal worker to handle audio playback in a separate thread.
+    This allows the main loop to continue listening for interruptions.
     """
     global engine
-    print(f"Kimi: {text}")
-    
-    # Ensure no previous speech is hanging.
     try:
+        # User-forced fallback to PowerShell for maximum reliability.
+        if os.getenv("FORCE_POWERSHELL_TTS", "false").lower() == "true":
+            speak_powershell(text)
+            return
+
         with speak_lock:
-            engine.stop()
-    except:
-        pass
-
-    # User-forced fallback to PowerShell for maximum reliability.
-    if os.getenv("FORCE_POWERSHELL_TTS", "false").lower() == "true":
-        return speak_powershell(text)
-
-    with speak_lock:
-        try:
-            # Check if engine is still valid; if not, re-init
+            # Re-init engine if it crashed or is missing.
             if not engine:
                 engine = pyttsx3.init()
                 configure_voice()
             
             engine.say(text)
             engine.runAndWait()
-        except Exception as error:
-            print(f"pyttsx3 failed, using PowerShell fallback: {error}")
-            speak_powershell(text)
+    except Exception as error:
+        print(f"Speech thread error: {error}")
+        # Final safety fallback
+        speak_powershell(text)
+
+def speak(text, block=False):
+    """
+    Convert text to speech. Prints text and plays audio asynchronously by default.
+    Set block=True for startup or critical messages that must finish before proceeding.
+    """
+    print(f"Kimi: {text}")
+    
+    # Always clear stop event before starting new speech
+    stop_event.clear()
+
+    if block:
+        _speak_worker(text)
+    else:
+        # Run speech in background thread so the main program can listen for "Kimi stop"
+        threading.Thread(target=_speak_worker, args=(text,), daemon=True).start()
+
+
+def stop_speaking():
+    """Immediately stop any ongoing TTS output."""
+    global engine
+    print("[SYSTEM] Interrupting speech...")
+    stop_event.set()
+    try:
+        with speak_lock:
+            if engine:
+                engine.stop()
+    except Exception as e:
+        print(f"Error stopping engine: {e}")
+    
+    # Also attempt to kill any background powershell TTS processes
+    try:
+        subprocess.run(["taskkill", "/IM", "powershell.exe", "/F"], capture_output=True, check=False)
+    except:
+        pass
 
 
 def compose_action_reply(text):
@@ -1626,13 +1662,22 @@ def process_command(command):
     if not command:
         return True
 
-    # Keep local shutdown command explicit for reliable loop control.
-    if command.lower().strip() in EXIT_KEYWORDS:
-        reply = "Goodbye. Shutting down Kimi."
+    # Strip "Kimi" wake-word if present for cleaner processing (e.g., "Kimi open chrome" -> "open chrome")
+    clean_text = command.lower().strip()
+    if clean_text.startswith("kimi "):
+        clean_text = clean_text[len("kimi "):].strip()
+
+    # Priority check for shut down / stop commands
+    if command.lower().strip() in EXIT_KEYWORDS or clean_text in EXIT_KEYWORDS:
+        reply = "Understood, boss. Shutting down now. Goodbye!"
         speak(reply)
         add_to_history("user", command)
         add_to_history("assistant", reply)
         return False
+
+    # Proceed with the cleaned text for further processing
+    command = clean_text if clean_text else command
+
 
     # Update lightweight personalization memory from user text.
     update_memory(command)
@@ -1671,32 +1716,55 @@ def process_command(command):
 
 def main():
     """
-    Run Kimi in a continuous listening loop without wake-word requirement.
-    Every recognized instruction is processed directly.
+    Run Kimi in a continuous listening loop with background interrupt support.
     """
-    # Force a fresh engine and a clear startup message.
+    global stop_listening_callback
+
+    # Initial boot sequence
     startup_msg = "Kimi is online and ready for you, boss."
     print(f"\n[BOOT] {startup_msg}")
-    speak(startup_msg)
+    speak(startup_msg, block=True)
 
-    while True:
+    # Initialize the background listener for interruption commands
+    recognizer = sr.Recognizer()
+    mic = sr.Microphone()
+    
+    try:
+        with mic as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        
+        # This starts a background thread that calls control_callback
+        print("[BOOT] Background interrupt listener active.")
+        stop_listening_callback = recognizer.listen_in_background(mic, control_callback, phrase_time_limit=3)
+    except Exception as e:
+        print(f"[BOOT] Failed to start background listener: {e}")
+
+    while not shutdown_event.is_set():
         try:
             heard_text = listen()
+            
+            # Check for shutdown signal that might have come from background thread
+            if shutdown_event.is_set():
+                break
+
             if not heard_text:
-                speak("Can you repeat that?")
+                # Don't speak "Can you repeat that" automatically to avoid noise loops
                 continue
 
             should_continue = process_command(heard_text)
-            if not should_continue:
+            if not should_continue or shutdown_event.is_set():
                 break
         except KeyboardInterrupt:
-            print("\nShutting down Kimi...")
             break
         except Exception as e:
             print(f"Loop error: {e}")
             continue
 
-    # Clean up TTS engine to avoid AttributeError on exit
+    # Cleanup shutdown sequence
+    print("\n[EXIT] Shutting down Kimi...")
+    if stop_listening_callback:
+        stop_listening_callback(wait_for_stop=False)
+    
     try:
         engine.stop()
     except:
