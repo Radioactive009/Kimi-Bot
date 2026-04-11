@@ -48,10 +48,12 @@ def install_missing_packages():
             # Check if package is already there
             if package == "duckduckgo-search":
                 import duckduckgo_search
+            elif package == "beautifulsoup4":
+                import bs4
             else:
                 __import__(package.replace("-", "_"))
         except ImportError:
-            print(f"[BOOT] Installing missing package: {package}...")
+            print(f"[BOOT] Installing missing package: {package}...", flush=True)
             try:
                 subprocess.run([sys.executable, "-m", "pip", "install", package], capture_output=True, check=True)
                 print(f"[BOOT] Successfully installed {package}!")
@@ -112,6 +114,10 @@ stop_event = threading.Event()
 shutdown_event = threading.Event()
 # To keep track of the background listener stop function
 stop_listening_callback = None
+
+# Global audio resources to avoid multiple instance conflicts on Windows
+global_recognizer = sr.Recognizer()
+global_mic = sr.Microphone()
 MAX_LISTEN_RETRIES = 3
 MAX_FILE_SEARCH_RESULTS = 10
 MAX_APP_LIST_RESULTS = 25
@@ -1469,25 +1475,20 @@ def try_local_quick_actions(command):
 def listen(retries=MAX_LISTEN_RETRIES):
     """
     Listen to microphone input and convert speech to text.
-    Speech improvements:
-    - Ambient noise calibration per attempt
-    - Retry up to `retries` times
-    - Better timeout handling for short pauses
-    Returns recognized text in lowercase, or empty string if recognition fails.
+    Uses global shared resources to avoid resource conflict.
     """
-    recognizer = sr.Recognizer()
     for attempt in range(1, retries + 1):
         try:
-            with sr.Microphone() as source:
-                print("Listening...")
+            with global_mic as source:
+                print("Listening...", flush=True)
                 # Noise calibration helps with fans/background speech.
-                recognizer.adjust_for_ambient_noise(source, duration=0.7)
-                audio = recognizer.listen(source, timeout=6, phrase_time_limit=10)
+                global_recognizer.adjust_for_ambient_noise(source, duration=0.7)
+                audio = global_recognizer.listen(source, timeout=6, phrase_time_limit=10)
 
-            print("Recognizing...")
-            command = recognizer.recognize_google(audio)
+            print("Recognizing...", flush=True)
+            command = global_recognizer.recognize_google(audio)
             command = command.lower().strip()
-            print(f"You said: {command}")
+            print(f"You said: {command}", flush=True)
             return command
 
         except sr.WaitTimeoutError:
@@ -1514,6 +1515,35 @@ def listen(retries=MAX_LISTEN_RETRIES):
             return ""
 
     return ""
+
+
+def control_callback(recognizer, audio):
+    """
+    Background listener callback specifically looking for 'Kimi stop' or 'Kimi shut down'.
+    Uses the same recognizer instance passed from listen_in_background.
+    """
+    try:
+        # Avoid processing background noise during initial startup
+        if not stop_listening_callback:
+            return
+
+        text = recognizer.recognize_google(audio).lower().strip()
+        if text:
+            print(f"[BG_HEARTBEAT] Heard: '{text}'", flush=True)
+            
+        if "kimi stop" in text or "stop speaking" in text:
+            print(f"[INTERRUPT] Heard: '{text}' -> Stopping Kimi.", flush=True)
+            stop_speaking()
+        
+        if "kimi shut down" in text or "kimi shutdown" in text or "kimi shut-down" in text:
+            print(f"[SHUTDOWN] Heard: '{text}' -> Shutting down.", flush=True)
+            stop_speaking()
+            shutdown_event.set()
+            
+    except sr.UnknownValueError:
+        pass
+    except Exception as e:
+        print(f"[BG_ERROR] {e}", flush=True)
 
 
 def open_chrome():
@@ -1670,7 +1700,7 @@ def process_command(command):
     # Priority check for shut down / stop commands
     if command.lower().strip() in EXIT_KEYWORDS or clean_text in EXIT_KEYWORDS:
         reply = "Understood, boss. Shutting down now. Goodbye!"
-        speak(reply)
+        speak(reply, block=True)
         add_to_history("user", command)
         add_to_history("assistant", reply)
         return False
@@ -1722,33 +1752,32 @@ def main():
 
     # Initial boot sequence
     startup_msg = "Kimi is online and ready for you, boss."
-    print(f"\n[BOOT] {startup_msg}")
+    print(f"\n[BOOT] {startup_msg}", flush=True)
     speak(startup_msg, block=True)
 
-    # Initialize the background listener for interruption commands
-    recognizer = sr.Recognizer()
-    mic = sr.Microphone()
-    
     try:
-        with mic as source:
-            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        # Calibrate ambient noise on the shared global_mic before starting loop/background thread
+        print("[BOOT] Calibrating microphone for ambient noise...", flush=True)
+        with global_mic as source:
+            global_recognizer.adjust_for_ambient_noise(source, duration=0.8)
         
         # This starts a background thread that calls control_callback
-        print("[BOOT] Background interrupt listener active.")
-        stop_listening_callback = recognizer.listen_in_background(mic, control_callback, phrase_time_limit=3)
+        # We start it only AFTER the startup message and calibration
+        print("[BOOT] Background interrupt listener active.", flush=True)
+        stop_listening_callback = global_recognizer.listen_in_background(global_mic, control_callback, phrase_time_limit=3)
     except Exception as e:
-        print(f"[BOOT] Failed to start background listener: {e}")
+        print(f"[BOOT] Failed to start background listener: {e}", flush=True)
 
     while not shutdown_event.is_set():
         try:
+            # Main blocking listen call
             heard_text = listen()
             
-            # Check for shutdown signal that might have come from background thread
+            # Re-check shutdown signal after listening (it might have come from BG thread)
             if shutdown_event.is_set():
                 break
 
             if not heard_text:
-                # Don't speak "Can you repeat that" automatically to avoid noise loops
                 continue
 
             should_continue = process_command(heard_text)
@@ -1757,11 +1786,12 @@ def main():
         except KeyboardInterrupt:
             break
         except Exception as e:
-            print(f"Loop error: {e}")
+            print(f"Loop error: {e}", flush=True)
+            time.sleep(1) # Breath on repeated errors
             continue
 
     # Cleanup shutdown sequence
-    print("\n[EXIT] Shutting down Kimi...")
+    print("\n[EXIT] Shutting down Kimi...", flush=True)
     if stop_listening_callback:
         stop_listening_callback(wait_for_stop=False)
     
