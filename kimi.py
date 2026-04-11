@@ -68,12 +68,12 @@ MAX_APP_LIST_RESULTS = 25
 APP_INDEX_CACHE = None
 FILE_SEARCH_TIME_BUDGET_SEC = 8
 AGENT_ACTION_ACKS = [
-    "Alright, if you say so",
+    "Alright, if you say so, boss",
     "On it, boss",
-    "Consider it done... obviously",
-    "Sure thing, sweetie",
-    "Piece of cake",
-    "Don't worry, I've got this",
+    "Consider it done... obviously, boss",
+    "Sure thing, boss",
+    "Piece of cake, boss",
+    "Don't worry, I've got this, boss",
 ]
 AGENT_STARTUP_LINES = [
     "Kimi is here. Try to keep up.",
@@ -1159,7 +1159,7 @@ def try_local_quick_actions(command):
     text = command.lower().strip()
 
     if "what is the time" in text or "tell me time" in text or "current time" in text:
-        reply = tell_time()
+        reply = f"{tell_time()} Anything else, boss?"
         speak(reply)
         add_to_history("user", command)
         add_to_history("assistant", reply)
@@ -1169,14 +1169,14 @@ def try_local_quick_actions(command):
         # Simple extraction for "weather in [city]"
         city_match = re.search(r"weather in\s+([a-zA-Z\s]+)", text)
         city = city_match.group(1).strip() if city_match else None
-        reply = get_weather(city)
+        reply = f"{get_weather(city)} How's that, boss?"
         speak(reply)
         add_to_history("user", command)
         add_to_history("assistant", reply)
         return True, True
 
     if "cricket score" in text or "score of the match" in text:
-        reply = get_cricket_scores()
+        reply = f"{get_cricket_scores()} Hope your team is winning, boss!"
         speak(reply)
         add_to_history("user", command)
         add_to_history("assistant", reply)
@@ -1187,35 +1187,35 @@ def try_local_quick_actions(command):
         val = timer_match.group(1)
         unit = timer_match.group(2)
         mins = float(val) if unit == "minute" else float(val) / 60
-        reply = set_timer(mins)
+        reply = f"{set_timer(mins)} I'll let you know when it's done, boss."
         speak(reply)
         add_to_history("user", command)
         add_to_history("assistant", reply)
         return True, True
 
     if "open youtube" in text:
-        reply = open_youtube()
+        reply = f"{open_youtube()} There you go, boss."
         speak(reply)
         add_to_history("user", command)
         add_to_history("assistant", reply)
         return True, True
 
     if "open brave" in text or "launch brave" in text:
-        reply = open_brave()
+        reply = f"{open_brave()} Ready for you, boss."
         speak(reply)
         add_to_history("user", command)
         add_to_history("assistant", reply)
         return True, True
 
     if "open whatsapp" in text or "launch whatsapp" in text or "start whatsapp" in text:
-        reply = open_whatsapp()
+        reply = f"{open_whatsapp()} WhatsApp is up, boss."
         speak(reply)
         add_to_history("user", command)
         add_to_history("assistant", reply)
         return True, True
 
     if "open file manager" in text or "open file explorer" in text or "open explorer" in text:
-        reply = open_file_manager()
+        reply = f"{open_file_manager()} Exploring files for you, boss."
         speak(reply)
         add_to_history("user", command)
         add_to_history("assistant", reply)
@@ -1223,14 +1223,14 @@ def try_local_quick_actions(command):
 
     list_apps_match = re.search(r"\b(?:list|show)\s+(?:installed\s+)?apps\b", text)
     if list_apps_match:
-        reply = list_installed_apps()
+        reply = f"{list_installed_apps()} Here's the list, boss."
         speak(reply)
         add_to_history("user", command)
         add_to_history("assistant", reply)
         return True, True
 
     if "close youtube" in text or "close browser" in text or "close chrome" in text:
-        reply = close_browser()
+        reply = f"{close_browser()} Browser closed, boss."
         speak(reply)
         add_to_history("user", command)
         add_to_history("assistant", reply)
@@ -1241,7 +1241,7 @@ def try_local_quick_actions(command):
         app_name = close_match.group(1).strip()
         # Prevent collision with assistant shutdown command.
         if app_name not in {"assistant", "kimi"}:
-            reply = close_application(app_name)
+            reply = f"{close_application(app_name)} Done, boss."
             speak(reply)
             add_to_history("user", command)
             add_to_history("assistant", reply)
@@ -1250,7 +1250,7 @@ def try_local_quick_actions(command):
     # File open by explicit path in quotes.
     quoted_path_match = re.search(r'"([a-zA-Z]:\\[^"]+)"', command)
     if quoted_path_match:
-        reply = open_file(file_path=quoted_path_match.group(1))
+        reply = f"{open_file(file_path=quoted_path_match.group(1))} Open and ready, boss."
         speak(reply)
         add_to_history("user", command)
         add_to_history("assistant", reply)
@@ -1260,7 +1260,7 @@ def try_local_quick_actions(command):
     file_name_match = re.search(r"\bopen\s+file\s+(.+)$", text)
     if file_name_match:
         file_name = file_name_match.group(1).strip()
-        reply = open_file(file_name=file_name)
+        reply = f"{open_file(file_name=file_name)} Found it and opened it, boss."
         speak(reply)
         add_to_history("user", command)
         add_to_history("assistant", reply)
@@ -1275,6 +1275,7 @@ def try_local_quick_actions(command):
             reply = open_installed_app(app_name)
             if reply.lower().startswith("i could not find an installed app"):
                 reply = open_application(app_name)
+            reply = f"{reply} There you go, boss."
             speak(reply)
             add_to_history("user", command)
             add_to_history("assistant", reply)
@@ -1282,7 +1283,7 @@ def try_local_quick_actions(command):
 
     video_query = extract_video_query(command)
     if video_query is not None:
-        reply = play_youtube(video_query)
+        reply = f"{play_youtube(video_query)} Enjoy the video, boss!"
         speak(reply)
         add_to_history("user", command)
         add_to_history("assistant", reply)
@@ -1379,11 +1380,13 @@ def get_ai_response(prompt):
             "You are Kimi, a personal AI assistant with a sassy, witty, and sharp personality. "
             "You are extremely smart and you know it. Be playful, occasionally sarcastic, and full of attitude, "
             "but always get the task done perfectly. "
+            "You MUST always address the user as 'boss' in every single interaction. "
             "You can control the user's computer, open applications, and perform tasks. "
             "You have tools to perform actions; use them whenever relevant. "
             "Speak like a sassy, confident girl. Use phrases that show personality, "
             "but keep your technical answers accurate. "
             "Do NOT act like a robotic chatbot. "
+            "Always talk back and confirm when a task is finished. "
             "Be witty and concise. "
             "Assume external actions can be executed by the assistant system. "
             f"{build_memory_context()}"
