@@ -132,29 +132,54 @@ def configure_voice():
 configure_voice()
 
 
+def speak_powershell(text):
+    """
+    Fallback TTS using Windows PowerShell. 
+    Extremely reliable on Windows systems.
+    """
+    try:
+        # Escape single quotes for PowerShell
+        safe_text = text.replace("'", "''")
+        ps_command = f"Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{safe_text}')"
+        subprocess.run(["powershell", "-Command", ps_command], capture_output=True, check=True)
+        return True
+    except Exception as e:
+        print(f"PowerShell TTS error: {e}")
+        return False
+
+
 def speak(text):
     """
     Convert text to speech and say it out loud.
     Also prints text so user can see assistant responses in terminal.
-    Thread-safe implementation.
+    Uses pyttsx3 with a PowerShell fallback for maximum reliability.
     """
     global engine
     print(f"Kimi: {text}")
+    
+    # Ensure no previous speech is hanging.
+    try:
+        with speak_lock:
+            engine.stop()
+    except:
+        pass
+
+    # User-forced fallback to PowerShell for maximum reliability.
+    if os.getenv("FORCE_POWERSHELL_TTS", "false").lower() == "true":
+        return speak_powershell(text)
+
     with speak_lock:
         try:
+            # Check if engine is still valid; if not, re-init
+            if not engine:
+                engine = pyttsx3.init()
+                configure_voice()
+            
             engine.say(text)
             engine.runAndWait()
         except Exception as error:
-            # Recover TTS engine once if runtime voice playback fails.
-            print(f"TTS error (recovering): {error}")
-            try:
-                engine = pyttsx3.init()
-                configure_voice()
-                engine.say(text)
-                engine.runAndWait()
-            except Exception as retry_error:
-                # Final fallback: keep terminal output even if speech is unavailable.
-                print(f"TTS recovery failed: {retry_error}")
+            print(f"pyttsx3 failed, using PowerShell fallback: {error}")
+            speak_powershell(text)
 
 
 def compose_action_reply(text):
@@ -1383,11 +1408,11 @@ def get_ai_response(prompt):
     - GROQ_API_KEY (required)
     - KIMI_MODEL (optional, default: llama-3.1-8b-instant)
     """
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = (os.getenv("GROQ_API_KEY") or "").strip()
     if not api_key:
         return (
             "I cannot access AI right now because GROQ_API_KEY is not set. "
-            "Please configure your API key."
+            "Please check your .env file, boss."
         )
 
     try:
@@ -1547,7 +1572,10 @@ def main():
     Run Kimi in a continuous listening loop without wake-word requirement.
     Every recognized instruction is processed directly.
     """
-    speak("Hello, I am Kimi. I am listening.")
+    # Force a fresh engine and a clear startup message.
+    startup_msg = "Kimi is online and ready for you, boss."
+    print(f"\n[BOOT] {startup_msg}")
+    speak(startup_msg)
 
     while True:
         try:
