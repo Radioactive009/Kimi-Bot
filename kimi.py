@@ -1238,6 +1238,10 @@ def run_model_completion(client, messages, tools=None):
                 kwargs["tool_choice"] = "auto"
             return client.chat.completions.create(**kwargs)
         except Exception as model_error:
+            error_msg = str(model_error).lower()
+            if "401" in error_msg or "invalid_api_key" in error_msg or "unauthorized" in error_msg:
+                # Raise a specific error that the caller can catch for a clearer user message.
+                raise PermissionError("INVALID_GROQ_API_KEY")
             print(f"Groq model failed ({model}): {model_error}")
             continue
 
@@ -1630,9 +1634,13 @@ def get_ai_response(prompt):
         messages.append({"role": "user", "content": prompt})
 
         tools = get_tool_schemas()
-        first_response = run_model_completion(client, messages, tools=tools)
+        try:
+            first_response = run_model_completion(client, messages, tools=tools)
+        except PermissionError:
+            return "Boss, your Groq API key is currently invalid. Please update the GROQ_API_KEY in your .env file."
+
         if not first_response or not first_response.choices:
-            return "I could not generate a response right now."
+            return "I could not generate a response right now. Please check your connection or API status, boss."
 
         assistant_message = first_response.choices[0].message
         tool_calls = getattr(assistant_message, "tool_calls", None) or []
