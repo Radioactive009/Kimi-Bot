@@ -4,3 +4,6 @@ PyAudio
 groq
 python-dotenv
 pywhatkit
+duckduckgo-search
+bs4
+requests

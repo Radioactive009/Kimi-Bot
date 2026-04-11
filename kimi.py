@@ -37,6 +37,11 @@ try:
 except ImportError:
     pywhatkit = None
 
+try:
+    from duckduckgo_search import DDGS
+except ImportError:
+    DDGS = None
+
 # Load environment variables from .env file.
 load_dotenv()
 
@@ -838,6 +843,37 @@ def find_files(file_query, limit=MAX_FILE_SEARCH_RESULTS):
     return matches
 
 
+def search_web(query, max_results=5):
+    """
+    Tool: search the web for real-time information, news, sports scores, and more.
+    Uses DuckDuckGo snippets to provide the latest data.
+    """
+    q = (query or "").strip()
+    if not q:
+        return "Please tell me what to search for, boss."
+    
+    if DDGS is None:
+        return "I'm sorry boss, but the web search library is not installed."
+
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(q, max_results=max_results))
+            if not results:
+                return f"I couldn't find any web results for '{q}', boss."
+            
+            output = []
+            for r in results:
+                title = r.get("title", "No Title")
+                snippet = r.get("body", "No Snippet")
+                link = r.get("href", "#")
+                output.append(f"• {title}\n  {snippet}\n  (Link: {link})")
+            
+            summary = "\n\n".join(output)
+            return f"Here's what I found online for '{q}', boss:\n\n{summary}"
+    except Exception as e:
+        return f"Search error while looking for '{q}': {e}"
+
+
 def open_file(file_path=None, file_name=None):
     """
     Tool: open a file by exact path or by searching file name.
@@ -1021,6 +1057,17 @@ TOOL_REGISTRY = {
                 "message": {"type": "string", "description": "Optional label or reminder for the timer."}
             },
             "required": ["minutes"],
+        },
+    },
+    "search_web": {
+        "function": search_web,
+        "description": "searches the web for real-time information, news, sports scores, movie details, and general knowledge",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The search query for live information."}
+            },
+            "required": ["query"],
         },
     },
 }
@@ -1326,7 +1373,25 @@ def try_local_quick_actions(command):
         add_to_history("assistant", f"Enjoy the video, boss!")
         return True, True
 
-    return False, True
+    # Web search explicit command: "search for [topic]"
+    search_match = re.search(r"\b(?:search for|find out about|look up|get details on)\s+(.+)$", text)
+    if search_match:
+        query = search_match.group(1).strip()
+        speak(f"Searching the web for {query}, boss.")
+        reply = search_web(query)
+        speak(reply)
+        add_to_history("user", command)
+        add_to_history("assistant", reply)
+        return True, True
+
+    # General "latest" news/scores catch-all
+    if "latest" in text or "news" in text or "score" in text:
+        speak("Let me check the latest updates for you, boss.")
+        reply = search_web(text)
+        speak(reply)
+        add_to_history("user", command)
+        add_to_history("assistant", reply)
+        return True, True
 
     return False, True
 
@@ -1423,7 +1488,9 @@ def get_ai_response(prompt):
             "but always get the task done perfectly. "
             "You MUST always address the user as 'boss' in every single interaction. "
             "You can control the user's computer, open applications, and perform tasks. "
-            "You have tools to perform actions; use them whenever relevant. "
+            "You have a 'search_web' tool; use it proactively for any questions about recent events, "
+            "live sports scores (like IPL), news, films, or anything you don't have current knowledge of. "
+            "You are now a 'web-surfing' assistant. If asked about news, films, or sports, surf the web first! "
             "Speak like a sassy, confident girl. Use phrases that show personality, "
             "but keep your technical answers accurate. "
             "Do NOT act like a robotic chatbot. "
@@ -1432,6 +1499,7 @@ def get_ai_response(prompt):
             "Assume external actions can be executed by the assistant system. "
             f"{build_memory_context()}"
         )
+
 
         messages = [{"role": "system", "content": system_message}]
         messages.extend(conversation_history)
