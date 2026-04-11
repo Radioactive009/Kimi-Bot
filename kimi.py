@@ -17,9 +17,11 @@ import datetime
 import difflib
 import json
 import os
+import queue
 import random
 import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -60,11 +62,14 @@ def install_missing_packages():
             except Exception as e:
                 print(f"[BOOT] Failed to install {package}: {e}")
 
-import sys
+# Redundant sys import removed
 install_missing_packages()
 
 try:
-    from duckduckgo_search import DDGS
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        from duckduckgo_search import DDGS
 except ImportError:
     DDGS = None
 
@@ -118,6 +123,8 @@ stop_listening_callback = None
 # Global audio resources to avoid multiple instance conflicts on Windows
 global_recognizer = sr.Recognizer()
 global_mic = sr.Microphone()
+# Queue for passing voice commands from background listener to main thread
+voice_command_queue = queue.Queue()
 MAX_LISTEN_RETRIES = 3
 MAX_FILE_SEARCH_RESULTS = 10
 MAX_APP_LIST_RESULTS = 25
@@ -1472,78 +1479,49 @@ def try_local_quick_actions(command):
     return False, True
 
 
-def listen(retries=MAX_LISTEN_RETRIES):
-    """
-    Listen to microphone input and convert speech to text.
-    Uses global shared resources to avoid resource conflict.
-    """
-    for attempt in range(1, retries + 1):
-        try:
-            with global_mic as source:
-                print("Listening...", flush=True)
-                # Noise calibration helps with fans/background speech.
-                global_recognizer.adjust_for_ambient_noise(source, duration=0.7)
-                audio = global_recognizer.listen(source, timeout=6, phrase_time_limit=10)
-
-            print("Recognizing...", flush=True)
-            command = global_recognizer.recognize_google(audio)
-            command = command.lower().strip()
-            print(f"You said: {command}", flush=True)
-            return command
-
-        except sr.WaitTimeoutError:
-            print(f"No speech detected (attempt {attempt}/{retries}).")
-            continue
-        except sr.UnknownValueError:
-            print(f"Speech unclear (attempt {attempt}/{retries}).")
-            if attempt == retries:
-                speak("I'm sorry boss, I didn't catch that. Could you say it again?")
-            continue
-        except sr.RequestError:
-            # Network/API issue for speech recognition service.
-            print("Speech service is unavailable. Check internet connection.")
-            speak("I am having trouble connecting to speech service.")
-            return ""
-        except OSError:
-            # Microphone/device issue.
-            print("Microphone not found or not accessible.")
-            speak("I cannot access the microphone.")
-            return ""
-        except Exception as error:
-            # Generic safeguard for unexpected issues.
-            print(f"Unexpected listen error: {error}")
-            return ""
-
     return ""
 
 
-def control_callback(recognizer, audio):
+def unified_voice_callback(recognizer, audio):
     """
-    Background listener callback specifically looking for 'Kimi stop' or 'Kimi shut down'.
-    Uses the same recognizer instance passed from listen_in_background.
+    The PRIMARY voice listener. It runs in its own background thread.
+    - Captures all audio.
+    - Handles 'Kimi stop' and 'Kimi shut down' immediately.
+    - Puts everything else in the voice_command_queue for the main brain.
     """
     try:
-        # Avoid processing background noise during initial startup
+        # Avoid processing until the listener is fully ready
         if not stop_listening_callback:
             return
 
         text = recognizer.recognize_google(audio).lower().strip()
-        if text:
-            print(f"[BG_HEARTBEAT] Heard: '{text}'", flush=True)
+        if not text:
+            return
             
+        print(f"[LISTENER_LOG] Heard: '{text}'", flush=True)
+
+        # 1. IMMEDIATE CONTROL COMMANDS (Interrupts)
         if "kimi stop" in text or "stop speaking" in text:
-            print(f"[INTERRUPT] Heard: '{text}' -> Stopping Kimi.", flush=True)
+            print(f"[CONTROL] Stop triggered.", flush=True)
             stop_speaking()
+            return
         
-        if "kimi shut down" in text or "kimi shutdown" in text or "kimi shut-down" in text:
-            print(f"[SHUTDOWN] Heard: '{text}' -> Shutting down.", flush=True)
+        if "kimi shut down" in text or "kimi shutdown" in text:
+            # Stricter matching for shutdown to avoid misfires
+            print(f"[CONTROL] Shutdown triggered.", flush=True)
             stop_speaking()
             shutdown_event.set()
-            
+            return
+
+        # 2. GENERAL BRAIN COMMANDS (Queued)
+        # We put it in the queue so the main thread processes it when ready
+        voice_command_queue.put(text)
+        
     except sr.UnknownValueError:
+        # Standard noise/unclear speech
         pass
     except Exception as e:
-        print(f"[BG_ERROR] {e}", flush=True)
+        print(f"[LISTENER_ERROR] {e}", flush=True)
 
 
 def open_chrome():
@@ -1746,7 +1724,8 @@ def process_command(command):
 
 def main():
     """
-    Run Kimi in a continuous listening loop with background interrupt support.
+    Run Kimi using a Unified Listener architecture.
+    The main thread waits on a command queue, while a single background thread handles the mic.
     """
     global stop_listening_callback
 
@@ -1756,44 +1735,62 @@ def main():
     speak(startup_msg, block=True)
 
     try:
-        # Calibrate ambient noise on the shared global_mic before starting loop/background thread
-        print("[BOOT] Calibrating microphone for ambient noise...", flush=True)
+        # Calibrate ambient noise ONCE before starting the unified listener
+        print("[BOOT] Calibrating microphone... Please stay quiet.", flush=True)
         with global_mic as source:
-            global_recognizer.adjust_for_ambient_noise(source, duration=0.8)
+            global_recognizer.adjust_for_ambient_noise(source, duration=1.0)
         
-        # This starts a background thread that calls control_callback
-        # We start it only AFTER the startup message and calibration
-        print("[BOOT] Background interrupt listener active.", flush=True)
-        stop_listening_callback = global_recognizer.listen_in_background(global_mic, control_callback, phrase_time_limit=3)
+        # Start the background unified listener thread
+        # This thread will handle stop/shutdown AND put commands in voice_command_queue
+        print("[BOOT] Unified listener starting...", flush=True)
+        stop_listening_callback = global_recognizer.listen_in_background(
+            global_mic, 
+            unified_voice_callback, 
+            phrase_time_limit=8
+        )
+        print("[BOOT] Kimi is ready for your commands.", flush=True)
+        
     except Exception as e:
-        print(f"[BOOT] Failed to start background listener: {e}", flush=True)
+        print(f"[BOOT_ERROR] Critical failure during microphone initialization: {e}", flush=True)
+        return
 
     while not shutdown_event.is_set():
         try:
-            # Main blocking listen call
-            heard_text = listen()
-            
-            # Re-check shutdown signal after listening (it might have come from BG thread)
-            if shutdown_event.is_set():
-                break
-
+            # Wait for a command from the background listener
+            # Timeout allows for periodic check of shutdown_event
+            try:
+                heard_text = voice_command_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+                
             if not heard_text:
                 continue
 
+            # Process the command found in the queue
             should_continue = process_command(heard_text)
             if not should_continue or shutdown_event.is_set():
                 break
+                
         except KeyboardInterrupt:
             break
         except Exception as e:
-            print(f"Loop error: {e}", flush=True)
-            time.sleep(1) # Breath on repeated errors
+            print(f"[BRAIN_ERROR] Loop error: {e}", flush=True)
             continue
 
     # Cleanup shutdown sequence
-    print("\n[EXIT] Shutting down Kimi...", flush=True)
+    print("\n[EXIT] Shutting down Kimi processes...", flush=True)
     if stop_listening_callback:
-        stop_listening_callback(wait_for_stop=False)
+        try:
+            stop_listening_callback(wait_for_stop=False)
+        except:
+            pass
+    
+    try:
+        with speak_lock:
+            if engine:
+                engine.stop()
+    except:
+        pass
     
     try:
         engine.stop()
