@@ -36,7 +36,14 @@ import requests
 import speech_recognition as sr
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-import google.generativeai as genai
+import google.generativeai as genai_legacy # Keep for potential fallback
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
+
 try:
     import pywhatkit
 except ImportError:
@@ -239,12 +246,24 @@ def _speak_worker(text):
 
         # Attempt high-quality neural TTS
         try:
+            # RELEASE LOCK: Ensure pygame mixer unloads the file before we try to write a new one
+            # This is critical on Windows to avoid "Permission Denied" errors.
+            try:
+                if pygame.mixer.get_init():
+                    pygame.mixer.music.unload()
+            except:
+                pass
+
             asyncio.run(_generate_audio(text))
             
             with speak_lock:
                 if stop_event.is_set():
                     return
                 
+                # Check if file exists before loading
+                if not os.path.exists(TEMP_AUDIO_FILE):
+                     raise FileNotFoundError(f"TTS file {TEMP_AUDIO_FILE} not created")
+
                 pygame.mixer.music.load(TEMP_AUDIO_FILE)
                 pygame.mixer.music.play()
                 
@@ -254,9 +273,11 @@ def _speak_worker(text):
                         pygame.mixer.music.stop()
                         break
                     time.sleep(0.05)
+            # Success, so skip the fallback
             return
         except Exception as e:
-            # Silently log network/neural errors and proceed to fallback
+            # Log the specific error to help with "fine tuning" debugging
+            print(f"[TTS_DEBUG] Neural error: {e}")
             print(f"[TTS_NOTICE] Neural voice unavailable, using system fallback.")
 
         with speak_lock:
