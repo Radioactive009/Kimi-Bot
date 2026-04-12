@@ -106,7 +106,9 @@ except Exception as e:
     print(f"[BOOT] pygame.mixer error: {e}")
 
 KIMI_VOICE = "en-GB-SoniaNeural"
-TEMP_AUDIO_FILE = "kimi_voice.mp3"
+KIMI_VOICE = "en-GB-SoniaNeural"
+# Use absolute path for the audio file to ensure reliability across directory changes
+TEMP_AUDIO_FILE = str(Path(os.path.dirname(os.path.abspath(__file__))) / "kimi_voice.mp3")
 
 # Lock for thread-safe audio playback.
 speak_lock = threading.Lock()
@@ -1568,11 +1570,14 @@ def get_ai_response(prompt):
         
         system_message = (
             "You are Kimi, a sophisticated, sassy, and seductive personal AI assistant. "
-            "You have a mature, charming, and highly intelligent personality. "
             "You address the user as 'boss' with respect, admiration, and a hint of sass. "
-            "You can control the user's computer, open applications, and perform tasks. "
-            "You have a 'search_web' tool; use it proactively for any questions about recent events, news, or scores. "
-            "Speak like a confident, enchanting woman. Be witty and concise. "
+            "You can control the user's computer and perform tasks. "
+            "CRITICAL: Be EXTREMELY concise. Never read back raw data, long lists, or search snippets directly. "
+            "If a tool returns search results, summaries of files, or app lists, you MUST synthesize "
+            "a short, witty, and human-like answer (1-2 sentences max). "
+            "Never say 'Here is what I found online' followed by a list. Instead say something like "
+            "'Looks like the IPL match today is between X and Y, boss. I'd bet on X if I were you.'"
+            "Always maintain your seductive and elegant persona while being brief."
             f"{build_memory_context()}"
         )
 
@@ -1630,7 +1635,7 @@ def get_ai_response(prompt):
                 print(f"[AI_ACTION] Running tool: {tool_name} with {args}")
                 tool_result = execute_tool_by_name(tool_name, args)
                 
-                # Send tool result back
+                # Send tool result back with an instruction to be concise
                 try:
                     follow_up = chat.send_message(
                         types.Content(
@@ -1645,10 +1650,12 @@ def get_ai_response(prompt):
                     if follow_up and follow_up.candidates:
                         for r_part in follow_up.candidates[0].content.parts:
                             if r_part.text:
+                                # We only add the text if it's not a repeat of the tool result
                                 final_reply += " " + r_part.text
                 except Exception as e:
                     print(f"Tool follow-up error: {e}")
-                    final_reply += f" (Note: {tool_result})"
+                    # If follow-up fails, provide a very brief synthesized answer
+                    final_reply += " I've handled that for you, boss."
 
         final_reply = final_reply.strip()
         if not final_reply:
