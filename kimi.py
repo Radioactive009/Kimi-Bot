@@ -36,13 +36,16 @@ import requests
 import speech_recognition as sr
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-import google.generativeai as genai_legacy # Keep for potential fallback
 try:
     from google import genai
     from google.genai import types
 except ImportError:
-    genai = None
-    types = None
+    # If the user doesn't have the new SDK, help them install it.
+    print("[BOOT] Critical: google-genai library is missing. Installing it for you...", flush=True)
+    import subprocess, sys
+    subprocess.run([sys.executable, "-m", "pip", "install", "google-genai"], check=True)
+    from google import genai
+    from google.genai import types
 
 try:
     import pywhatkit
@@ -1636,27 +1639,26 @@ def get_ai_response(prompt):
                 print(f"[AI_ACTION] Running tool: {tool_name} with {args}")
                 tool_result = execute_tool_by_name(tool_name, args)
                 
-                # Send tool result back with an instruction to be concise
+                # Send tool result back to Gemini to get the synthesized conversational response.
+                # Correct way to send function responses in modern SDK is a list of Parts.
                 try:
                     follow_up = chat.send_message(
-                        types.Content(
-                            parts=[
-                                types.Part.from_function_response(
-                                    name=tool_name,
-                                    response={"result": tool_result}
-                                )
-                            ]
-                        )
+                        message=[
+                            types.Part.from_function_response(
+                                name=tool_name,
+                                response={"result": tool_result}
+                            )
+                        ]
                     )
                     if follow_up and follow_up.candidates:
                         for r_part in follow_up.candidates[0].content.parts:
                             if r_part.text:
-                                # We only add the text if it's not a repeat of the tool result
+                                # Append the AI's summarized explanation of the tool data
                                 final_reply += " " + r_part.text
                 except Exception as e:
                     print(f"Tool follow-up error: {e}")
                     # If follow-up fails, provide a very brief synthesized answer
-                    final_reply += " I've handled that for you, boss."
+                    final_reply += " I've handled that for you, boss. The data is available if you need it."
 
         final_reply = final_reply.strip()
         if not final_reply:
@@ -1669,22 +1671,6 @@ def get_ai_response(prompt):
     except Exception as error:
         print(f"GenAI Brain Error: {error}")
         return "I'm having a little trouble thinking clearly, boss. Maybe check the logs?"
-
-
-def get_ai_response_legacy(prompt):
-    """Fallback using the old google-generativeai SDK."""
-    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
-    if not api_key:
-        return "Legacy AI Error: API key missing."
-    
-    try:
-        genai_legacy.configure(api_key=api_key)
-        model = genai_legacy.GenerativeModel(os.getenv("KIMI_MODEL", "gemini-1.5-flash"))
-        # Simplified legacy response (no tools)
-        response = model.generate_content(prompt)
-        return response.text if response else "Legacy error."
-    except Exception as e:
-        return f"Legacy AI failure: {e}"
 
 
 def process_command(command):
