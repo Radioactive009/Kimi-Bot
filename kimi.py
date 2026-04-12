@@ -36,7 +36,7 @@ import requests
 import speech_recognition as sr
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from groq import Groq
+import google.generativeai as genai
 try:
     import pywhatkit
 except ImportError:
@@ -113,12 +113,10 @@ MAX_HISTORY_MESSAGES = 10
 # Example: {"name": "Kislay", "likes": ["gym", "music"]}
 user_memory = {}
 
-# Groq model fallback chain.
-# Default is a stable production model as per Groq deprecation guidance.
-DEFAULT_MODEL = "llama-3.1-8b-instant"
+# Gemini model fallback chain.
+DEFAULT_MODEL = "gemini-flash-latest"
 FALLBACK_MODELS = [
-    "llama-3.3-70b-versatile",
-    "openai/gpt-oss-120b",
+    "gemini-1.5-flash",
 ]
 
 EXIT_KEYWORDS = {
@@ -1202,79 +1200,6 @@ TOOL_REGISTRY = {
 }
 
 
-def get_tool_schemas():
-    """
-    Build OpenAI/Groq-compatible tool schema list from TOOL_REGISTRY.
-    This is sent to the model so it can choose tools dynamically.
-    """
-    schemas = []
-    for name, spec in TOOL_REGISTRY.items():
-        schemas.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": spec["description"],
-                    "parameters": spec["parameters"],
-                },
-            }
-        )
-    return schemas
-
-
-def run_model_completion(client, messages, tools=None):
-    """
-    Run model completion with fallback model chain.
-    Optional `tools` enables tool/function-calling behavior.
-    """
-    preferred_model = os.getenv("KIMI_MODEL", DEFAULT_MODEL)
-    candidate_models = [preferred_model] + [m for m in FALLBACK_MODELS if m != preferred_model]
-
-    for model in candidate_models:
-        try:
-            kwargs = {"model": model, "messages": messages}
-            if tools is not None:
-                kwargs["tools"] = tools
-                kwargs["tool_choice"] = "auto"
-            return client.chat.completions.create(**kwargs)
-        except Exception as model_error:
-            error_msg = str(model_error).lower()
-            if "401" in error_msg or "invalid_api_key" in error_msg or "unauthorized" in error_msg:
-                # Raise a specific error that the caller can catch for a clearer user message.
-                raise PermissionError("INVALID_GROQ_API_KEY")
-            print(f"Groq model failed ({model}): {model_error}")
-            continue
-
-    return None
-
-
-def execute_tool_call(tool_call):
-    """
-    Execute one AI-requested tool call from TOOL_REGISTRY.
-    Returns string output to send back to the model/user.
-    """
-    tool_name = tool_call.function.name
-    spec = TOOL_REGISTRY.get(tool_name)
-    if not spec:
-        return f"Tool error: unknown tool '{tool_name}'."
-
-    try:
-        raw_args = tool_call.function.arguments or "{}"
-        parsed_args = json.loads(raw_args)
-        if not isinstance(parsed_args, dict):
-            parsed_args = {}
-    except json.JSONDecodeError:
-        parsed_args = {}
-
-    try:
-        tool_result = spec["function"](**parsed_args)
-        return str(tool_result)
-    except TypeError:
-        return f"Tool error: invalid arguments for '{tool_name}'."
-    except Exception as error:
-        return f"Tool error while running '{tool_name}': {error}"
-
-
 def execute_tool_by_name(tool_name, args=None):
     """
     Execute a tool directly by registry name.
@@ -1592,24 +1517,27 @@ def open_chrome():
     # Fallback if Chrome executable is not found.
     webbrowser.open("https://www.google.com")
     return "Chrome was not found, opening Google in your default browser."
+def transform_history_for_gemini(history):
+    """Transform Kimi role-based history into Gemini content blocks."""
+    gemini_history = []
+    for msg in history:
+        role = "user" if msg["role"] == "user" else "model"
+        gemini_history.append({"role": role, "parts": [msg["content"]]})
+    return gemini_history
 
 
 def get_ai_response(prompt):
     """
-    Send user prompt to Groq model and return generated text response.
-    Uses environment variables for safety:
-    - GROQ_API_KEY (required)
-    - KIMI_MODEL (optional, default: llama-3.1-8b-instant)
+    Send user prompt to Gemini model and return generated response.
+    Supports tool calling for Kimi's PC control features.
     """
-    api_key = (os.getenv("GROQ_API_KEY") or "").strip()
+    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
-        return (
-            "I cannot access AI right now because GROQ_API_KEY is not set. "
-            "Please check your .env file, boss."
-        )
+        return "I cannot access AI right now because GEMINI_API_KEY is not set. Please check your .env file, boss."
 
     try:
-        client = Groq(api_key=api_key)
+        genai.configure(api_key=api_key)
+        
         system_message = (
             "You are Kimi, a sophisticated, sassy, and seductive personal AI assistant. "
             "You have a mature, charming, and highly intelligent personality. "
@@ -1628,92 +1556,83 @@ def get_ai_response(prompt):
             f"{build_memory_context()}"
         )
 
+        model_name = os.getenv("KIMI_MODEL", DEFAULT_MODEL)
+        
+        # Tools: Pass functions from the registry.
+        tools = [spec["function"] for spec in TOOL_REGISTRY.values()]
+        
+        model = genai.GenerativeModel(
+            model_name=model_name,
+            tools=tools,
+            system_instruction=system_message
+        )
 
-        messages = [{"role": "system", "content": system_message}]
-        messages.extend(conversation_history)
-        messages.append({"role": "user", "content": prompt})
-
-        tools = get_tool_schemas()
+        # Gemini Chat session handles history and multi-turn tool calling.
+        chat = model.start_chat(history=transform_history_for_gemini(conversation_history))
+        
         try:
-            first_response = run_model_completion(client, messages, tools=tools)
-        except PermissionError:
-            return "Boss, your Groq API key is currently invalid. Please update the GROQ_API_KEY in your .env file."
+            response = chat.send_message(prompt)
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "401" in error_msg or "unauthorized" in error_msg or "invalid" in error_msg:
+                return "Boss, your Gemini API key is invalid. Please check your .env file."
+            return f"Gemini error: {e}"
 
-        if not first_response or not first_response.choices:
-            return "I could not generate a response right now. Please check your connection or API status, boss."
+        if not response or not response.candidates:
+            return "I could not generate a response right now, boss."
 
-        assistant_message = first_response.choices[0].message
-        tool_calls = getattr(assistant_message, "tool_calls", None) or []
+        final_reply = ""
+        # Process all parts of the response (text and/or tool targets)
+        for part in response.candidates[0].content.parts:
+            if part.text:
+                final_reply += part.text
+            
+            if part.function_call:
+                # Execute the tool
+                tool_name = part.function_call.name
+                # Convert Gemini Map to Python Dict
+                args = {k: v for k, v in part.function_call.args.items()}
+                
+                print(f"[AI_ACTION] Running tool: {tool_name} with {args}")
+                tool_result = execute_tool_by_name(tool_name, args)
+                
+                # Send tool result back to Gemini to get the final conversational response
+                try:
+                    follow_up = chat.send_message(
+                        genai.types.Content(
+                            parts=[
+                                genai.types.Part(
+                                    function_response=genai.types.FunctionResponse(
+                                        name=tool_name,
+                                        response={"result": tool_result}
+                                    )
+                                )
+                            ]
+                        )
+                    )
+                    if follow_up and follow_up.candidates:
+                        for r_part in follow_up.candidates[0].content.parts:
+                            if r_part.text:
+                                final_reply += " " + r_part.text
+                except Exception as e:
+                    print(f"Follow-up error: {e}")
+                    final_reply += f" (Action result: {tool_result})"
 
-        # If model decided to call one or more tools, run them dynamically.
-        if tool_calls:
-            executed_tool_results = []
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": assistant_message.content or "",
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments or "{}",
-                            },
-                        }
-                        for tc in tool_calls
-                    ],
-                }
-            )
+        final_reply = final_reply.strip()
+        if not final_reply:
+            final_reply = "I've handled that for you, boss."
 
-            for tool_call in tool_calls:
-                tool_result = execute_tool_call(tool_call)
-                executed_tool_results.append(tool_result)
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": tool_result,
-                    }
-                )
-
-            final_response = run_model_completion(client, messages, tools=tools)
-            if final_response and final_response.choices and final_response.choices[0].message:
-                final_text = (final_response.choices[0].message.content or "").strip()
-                if not final_text:
-                    final_text = " Then ".join(executed_tool_results) if executed_tool_results else "Action completed."
-                if final_text.lower() in {"done", "done.", "completed", "complete."}:
-                    final_text = " Then ".join(executed_tool_results) if executed_tool_results else "Action completed."
-                add_to_history("user", prompt)
-                add_to_history("assistant", final_text)
-                return final_text
-
-            add_to_history("user", prompt)
-            fallback_text = " Then ".join(executed_tool_results) if executed_tool_results else "Action completed."
-            add_to_history("assistant", fallback_text)
-            return fallback_text
-
-        # No tool call needed: return direct assistant text.
-        direct_text = (assistant_message.content or "").strip()
-        embedded_tool_result = try_execute_embedded_function_text(direct_text)
-        if embedded_tool_result is not None:
-            add_to_history("user", prompt)
-            add_to_history("assistant", embedded_tool_result)
-            return embedded_tool_result
-
-        if direct_text:
-            add_to_history("user", prompt)
-            add_to_history("assistant", direct_text)
-            return direct_text
-
-        return "I received a response, but could not read it properly."
+        add_to_history("user", prompt)
+        add_to_history("assistant", final_reply)
+        return final_reply
 
     except Exception as error:
-        err_str = str(error).lower()
-        if "401" in err_str or "api key" in err_str:
-            return "Your Groq API key is invalid or revoked. Please update your .env file."
-        print(f"Groq API error: {error}")
-        return "I am having trouble reaching the AI service right now."
+        print(f"Gemini Brain Error: {error}")
+        return "I'm having a little trouble thinking clearly, boss. Please try again."
+
+    except Exception as error:
+        print(f"Gemini Brain Error: {error}")
+        return "I'm having a little trouble thinking clearly, boss. Please try again."
 
 
 def process_command(command):
