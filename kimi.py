@@ -107,8 +107,8 @@ except Exception as e:
 
 KIMI_VOICE = "en-GB-SoniaNeural"
 KIMI_VOICE = "en-GB-SoniaNeural"
-# Use absolute path for the audio file to ensure reliability across directory changes
-TEMP_AUDIO_FILE = str(Path(os.path.dirname(os.path.abspath(__file__))) / "kimi_voice.mp3")
+# Ensure absolute path for the audio file to avoid locking/access issues between threads
+TEMP_AUDIO_FILE = str(Path("kimi_voice.mp3").absolute())
 
 # Lock for thread-safe audio playback.
 speak_lock = threading.Lock()
@@ -232,6 +232,13 @@ async def _generate_audio(text):
     """Fetch neural audio from Edge TTS and save to temporary file."""
     communicate = edge_tts.Communicate(text, KIMI_VOICE)
     await communicate.save(TEMP_AUDIO_FILE)
+    # Verifying file creation for debug logging
+    if not os.path.exists(TEMP_AUDIO_FILE):
+        print(f"[TTS_DEBUG] Edge TTS reports success but file {TEMP_AUDIO_FILE} is missing.", flush=True)
+    else:
+        # Small delay to ensure Windows OS has finished syncing the file to disk
+        # before the player attempts to read it.
+        await asyncio.sleep(0.1)
 
 
 def _speak_worker(text):
@@ -1465,14 +1472,8 @@ def try_local_quick_actions(command):
         add_to_history("assistant", reply)
         return True, True
 
-    # General "latest" news/scores catch-all
-    if "latest" in text or "news" in text or "score" in text:
-        speak("Let me check the latest updates for you, boss.")
-        reply = search_web(text)
-        speak(reply)
-        add_to_history("user", command)
-        add_to_history("assistant", reply)
-        return True, True
+    # News/Scores catch-all removed to ensure AI summarizes the results 
+    # instead of reading raw search output.
 
     return False, True
 
