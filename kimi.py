@@ -1758,17 +1758,23 @@ def main():
         except:
             pass
     
+    # Release audio resources and forcefully terminate
     try:
-        with speak_lock:
-            if engine:
-                engine.stop()
+        if pygame.mixer.get_init():
+            pygame.mixer.music.stop()
+            pygame.mixer.quit()
     except:
         pass
-    
+
     try:
-        engine.stop()
+        if engine:
+            engine.stop()
     except:
         pass
+
+    # Force exit to ensure no lingering threads hold up the terminal
+    os._exit(0)
+
 
 
 if __name__ == "__main__":
