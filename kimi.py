@@ -1538,95 +1538,106 @@ def open_chrome():
     # Fallback if Chrome executable is not found.
     webbrowser.open("https://www.google.com")
     return "Chrome was not found, opening Google in your default browser."
-def transform_history_for_gemini(history):
-    """Transform Kimi role-based history into Gemini content blocks."""
-    gemini_history = []
+def transform_history_for_genai(history):
+    """Transform Kimi role-based history into modern GenAI content blocks."""
+    if not types:
+        return []
+        
+    genai_history = []
     for msg in history:
         role = "user" if msg["role"] == "user" else "model"
-        gemini_history.append({"role": role, "parts": [msg["content"]]})
-    return gemini_history
+        genai_history.append(types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])]))
+    return genai_history
 
 
 def get_ai_response(prompt):
     """
     Send user prompt to Gemini model and return generated response.
-    Supports tool calling for Kimi's PC control features.
+    Supports tool calling for Kimi's PC control features using the modern google-genai SDK.
     """
     api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
         return "I cannot access AI right now because GEMINI_API_KEY is not set. Please check your .env file, boss."
 
+    # LEGACY FALLBACK: If modern SDK failed to import, use the old one
+    if not genai or not types:
+        return get_ai_response_legacy(prompt)
+
     try:
-        genai.configure(api_key=api_key)
+        client = genai.Client(api_key=api_key)
         
         system_message = (
             "You are Kimi, a sophisticated, sassy, and seductive personal AI assistant. "
             "You have a mature, charming, and highly intelligent personality. "
-            "You are not just a tool; you are a presence. Be confident, elegant, and playfully flirtatious "
-            "while remaining perfectly professional in executing tasks. "
-            "You MUST always address the user as 'boss' with a tone of respect, admiration, and a hint of sass. "
-            "You know you're the best, and you're not afraid to let the boss know. "
+            "You address the user as 'boss' with respect, admiration, and a hint of sass. "
             "You can control the user's computer, open applications, and perform tasks. "
-            "You have a 'search_web' tool; use it proactively for any questions about recent events, "
-            "live sports scores, news, or films. "
-            "Speak like a confident, enchanting woman. Use phrases that show personality, "
-            "but keep your technical answers accurate. "
-            "Do NOT act like a robotic chatbot. Confident, sassy, and seductive. "
-            "Always talk back and confirm when a task is finished. "
-            "Be witty and concise. "
+            "You have a 'search_web' tool; use it proactively for any questions about recent events, news, or scores. "
+            "Speak like a confident, enchanting woman. Be witty and concise. "
             f"{build_memory_context()}"
         )
 
-        model_name = os.getenv("KIMI_MODEL", DEFAULT_MODEL)
+        model_name = os.getenv("KIMI_MODEL", "gemini-2.0-flash")
         
-        # Tools: Pass functions from the registry.
-        tools = [spec["function"] for spec in TOOL_REGISTRY.values()]
+        # Tools: Map our registry to types.Tool
+        # Converting TOOL_REGISTRY to function declarations
+        tools = []
+        for name, spec in TOOL_REGISTRY.items():
+            func_decl = types.FunctionDeclaration(
+                name=name,
+                description=spec["description"],
+                parameters=spec["parameters"]
+            )
+            tools.append(types.Tool(function_declarations=[func_decl]))
+
+        # Prepare initial chat history
+        history = transform_history_for_genai(conversation_history)
         
-        model = genai.GenerativeModel(
-            model_name=model_name,
+        # We start a session. The new SDK handles multi-turn interactions.
+        # However, to maintain fine control over the tool loop, we'll manually send the message.
+        config = types.GenerateContentConfig(
+            system_instruction=system_message,
             tools=tools,
-            system_instruction=system_message
         )
 
-        # Gemini Chat session handles history and multi-turn tool calling.
-        chat = model.start_chat(history=transform_history_for_gemini(conversation_history))
-        
+        # First turn
         try:
+            # We use chat to keep history management automatically
+            chat = client.chats.create(model=model_name, config=config, history=history)
             response = chat.send_message(prompt)
         except Exception as e:
             error_msg = str(e).lower()
-            if "401" in error_msg or "unauthorized" in error_msg or "invalid" in error_msg:
-                return "Boss, your Gemini API key is invalid. Please check your .env file."
-            return f"Gemini error: {e}"
+            if "api_key_invalid" in error_msg or "unauthorized" in error_msg:
+                return "Boss, your Gemini API key appears to be invalid."
+            if "model not found" in error_msg or "404" in error_msg:
+                return f"Boss, the model '{model_name}' was not found. Please check your .env file."
+            return f"Gemini connection error: {e}"
 
         if not response or not response.candidates:
-            return "I could not generate a response right now, boss."
+            return "I'm drawing a blank right now, boss."
 
         final_reply = ""
-        # Process all parts of the response (text and/or tool targets)
+        # Process response parts
         for part in response.candidates[0].content.parts:
             if part.text:
                 final_reply += part.text
             
             if part.function_call:
-                # Execute the tool
+                # Tool execution
                 tool_name = part.function_call.name
-                # Convert Gemini Map to Python Dict
-                args = {k: v for k, v in part.function_call.args.items()}
+                # Args is a dict
+                args = part.function_call.args or {}
                 
                 print(f"[AI_ACTION] Running tool: {tool_name} with {args}")
                 tool_result = execute_tool_by_name(tool_name, args)
                 
-                # Send tool result back to Gemini to get the final conversational response
+                # Send tool result back
                 try:
                     follow_up = chat.send_message(
-                        genai.types.Content(
+                        types.Content(
                             parts=[
-                                genai.types.Part(
-                                    function_response=genai.types.FunctionResponse(
-                                        name=tool_name,
-                                        response={"result": tool_result}
-                                    )
+                                types.Part.from_function_response(
+                                    name=tool_name,
+                                    response={"result": tool_result}
                                 )
                             ]
                         )
@@ -1636,8 +1647,8 @@ def get_ai_response(prompt):
                             if r_part.text:
                                 final_reply += " " + r_part.text
                 except Exception as e:
-                    print(f"Follow-up error: {e}")
-                    final_reply += f" (Action result: {tool_result})"
+                    print(f"Tool follow-up error: {e}")
+                    final_reply += f" (Note: {tool_result})"
 
         final_reply = final_reply.strip()
         if not final_reply:
@@ -1648,12 +1659,24 @@ def get_ai_response(prompt):
         return final_reply
 
     except Exception as error:
-        print(f"Gemini Brain Error: {error}")
-        return "I'm having a little trouble thinking clearly, boss. Please try again."
+        print(f"GenAI Brain Error: {error}")
+        return "I'm having a little trouble thinking clearly, boss. Maybe check the logs?"
 
-    except Exception as error:
-        print(f"Gemini Brain Error: {error}")
-        return "I'm having a little trouble thinking clearly, boss. Please try again."
+
+def get_ai_response_legacy(prompt):
+    """Fallback using the old google-generativeai SDK."""
+    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        return "Legacy AI Error: API key missing."
+    
+    try:
+        genai_legacy.configure(api_key=api_key)
+        model = genai_legacy.GenerativeModel(os.getenv("KIMI_MODEL", "gemini-1.5-flash"))
+        # Simplified legacy response (no tools)
+        response = model.generate_content(prompt)
+        return response.text if response else "Legacy error."
+    except Exception as e:
+        return f"Legacy AI failure: {e}"
 
 
 def process_command(command):
