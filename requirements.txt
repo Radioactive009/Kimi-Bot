@@ -9,5 +9,5 @@ bs4
 requests
 edge-tts
 pygame
-google-generativeai
+google-genai
 aiofiles

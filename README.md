@@ -68,7 +68,7 @@ If API key is missing or API call fails, Kimi responds with a friendly error mes
 
 ### Model fallback safety
 
-Kimi is now powered by the `google-generativeai` SDK. By default, it uses `gemini-1.5-flash`. if the primary model fails, Kimi automatically triggers a robust fallback to `gemini-1.5-pro` for maximum reliability.
+Kimi is now powered by the latest `google-genai` SDK for high-performance tool calling. By default, it uses `gemini-1.5-flash`. If the primary model fails, Kimi automatically triggers a robust fallback to `gemini-1.5-pro` for maximum reliability.
 
 ## AI Agent Tool Calling
 
