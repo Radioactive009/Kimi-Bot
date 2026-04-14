@@ -141,12 +141,16 @@ FALLBACK_MODELS = [
 _gemini_client = None
 
 def _get_gemini_client():
-    """Return a cached Gemini client, creating it once per session."""
+    """Return a cached Gemini client (v1 API), creating it once per session."""
     global _gemini_client
     if _gemini_client is None:
         api_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
         if api_key and genai:
-            _gemini_client = genai.Client(api_key=api_key)
+            # FORCE v1 API to avoid 404 on v1beta for standard models
+            _gemini_client = genai.Client(
+                api_key=api_key,
+                http_options={'api_version': 'v1'}
+            )
     return _gemini_client
 
 EXIT_KEYWORDS = {
@@ -306,11 +310,15 @@ def _speak_worker(text, voice=None):
                 asyncio.run(_generate_audio(text))
                 
             # EXTRA SAFETY: verify file exists before letting pygame touch it
+            # We poll briefly to allow the disk write to finish.
+            for _ in range(5):
+                if os.path.exists(TEMP_AUDIO_FILE) and os.path.getsize(TEMP_AUDIO_FILE) > 0:
+                    break
+                time.sleep(0.1)
+                
             if not os.path.exists(TEMP_AUDIO_FILE) or os.path.getsize(TEMP_AUDIO_FILE) == 0:
-                 # If file is missing, wait a heartbeat for OS sync, then skip
-                 time.sleep(0.1)
-                 if not os.path.exists(TEMP_AUDIO_FILE) or os.path.getsize(TEMP_AUDIO_FILE) == 0:
-                     raise FileNotFoundError(f"[TTS] Neural audio file missing or empty.")
+                 # Silently skip neural play and go to fallback if still missing
+                 raise FileNotFoundError(f"[TTS] Neural audio file not ready.")
 
             with speak_lock:
                 if stop_event.is_set():
@@ -1662,12 +1670,18 @@ def get_ai_response(prompt):
     fallback_model = "gemini-1.5-pro"
 
     for attempt in range(2): # Try twice: Flash then Pro
-        current_model = primary_model if attempt == 0 else fallback_model
+        current_model_name = primary_model if attempt == 0 else fallback_model
+        
+        # Clean the model name (SDK adds models/ if missing, but we'll be explicit and safe)
+        if not current_model_name.startswith("models/"):
+            model_id = f"models/{current_model_name}"
+        else:
+            model_id = current_model_name
         
         if attempt == 1:
-            print(f"[AI_FALLBACK] Primary model hit an edge case. Retrying with: {current_model}", flush=True)
+            print(f"[AI_FALLBACK] Retrying with fallback model: {model_id}", flush=True)
 
-        print(f"[AI_LOG] Using model: {current_model}", flush=True)
+        print(f"[AI_LOG] Using model: {model_id}", flush=True)
 
         try:
             # Language instruction
@@ -1683,7 +1697,7 @@ def get_ai_response(prompt):
                 tools=_get_gemini_tools()
             )
 
-            chat = client.chats.create(model=current_model, config=config, history=transform_history_for_genai(conversation_history))
+            chat = client.chats.create(model=model_id, config=config, history=transform_history_for_genai(conversation_history))
             response = chat.send_message(prompt)
 
             if not response or not response.candidates:
