@@ -1282,6 +1282,28 @@ TOOL_REGISTRY = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Pre-build the Gemini tools list ONCE at startup.
+# Re-creating 20+ FunctionDeclaration objects on every AI call adds latency.
+# ---------------------------------------------------------------------------
+_CACHED_GEMINI_TOOLS = None
+
+def _get_gemini_tools():
+    """Return pre-built Gemini tools list; build once and cache."""
+    global _CACHED_GEMINI_TOOLS
+    if _CACHED_GEMINI_TOOLS is None and types:
+        _CACHED_GEMINI_TOOLS = [
+            types.Tool(function_declarations=[
+                types.FunctionDeclaration(
+                    name=name,
+                    description=spec["description"],
+                    parameters=spec["parameters"],
+                )
+            ])
+            for name, spec in TOOL_REGISTRY.items()
+        ]
+    return _CACHED_GEMINI_TOOLS or []
+
 
 def execute_tool_by_name(tool_name, args=None):
     """
@@ -1537,65 +1559,54 @@ def try_local_quick_actions(command):
 def unified_voice_callback(recognizer, audio):
     """
     The PRIMARY voice listener. It runs in its own background thread.
-    - Captures all audio.
-    - Handles 'Kimi stop' and 'Kimi shut down' immediately.
-    - Detects language (Hindi vs English) and sets the TTS voice accordingly.
-    - Puts everything else in the voice_command_queue for the main brain.
+    - ONE fast STT call (avoids the double-call latency bug).
+    - Detects language from Devanagari chars in the result.
+    - Sets TTS voice for this turn before queuing the command.
     """
     global current_lang, KIMI_VOICE
     try:
-        # Avoid processing until the listener is fully ready
         if not stop_listening_callback:
             return
 
-        text = None
-        detected_lang = "en"
-
-        # Try Hindi first (hi-IN), then fall back to English
+        # ONE recognition call with en-IN.
+        # en-IN handles Indian English perfectly. If the user speaks pure Hindi,
+        # Google returns Devanagari script which we detect below.
         try:
-            text = recognizer.recognize_google(audio, language="hi-IN").strip()
-            if text:
-                # Heuristic: if recognized Hindi text contains a significant proportion
-                # of Devanagari characters it's really Hindi, otherwise treat as English.
-                devanagari_chars = sum(1 for c in text if '\u0900' <= c <= '\u097F')
-                if devanagari_chars >= 2 or len(text) > 0 and devanagari_chars / max(len(text), 1) > 0.1:
-                    detected_lang = "hi"
-                else:
-                    # Probably mis-recognized English as Hindi — re-run with English
-                    text = recognizer.recognize_google(audio, language="en-IN").strip()
-                    detected_lang = "en"
+            text = recognizer.recognize_google(audio, language="en-IN").strip()
         except sr.UnknownValueError:
-            try:
-                text = recognizer.recognize_google(audio, language="en-IN").strip()
-                detected_lang = "en"
-            except sr.UnknownValueError:
-                return
+            return  # Silence or unclear audio — just skip quietly
+        except sr.RequestError as e:
+            print(f"[STT_ERROR] Google STT unavailable: {e}", flush=True)
+            return
 
         if not text:
             return
 
-        # Update global language state and TTS voice for this turn
+        # Detect language from Devanagari characters in the recognized text
+        devanagari_count = sum(1 for c in text if '\u0900' <= c <= '\u097F')
+        detected_lang = "hi" if devanagari_count >= 2 else "en"
+
         current_lang = detected_lang
         KIMI_VOICE = KIMI_VOICE_HI if detected_lang == "hi" else KIMI_VOICE_EN
         print(f"[LISTENER_LOG] Lang={detected_lang.upper()} | Heard: '{text}'", flush=True)
 
-        # 1. IMMEDIATE CONTROL COMMANDS (support Hindi: "kimi bas", "kimi ruko")
-        if any(k in text.lower() for k in ["kimi stop", "stop speaking", "kimi bas", "kimi ruko"]):
-            print(f"[CONTROL] Stop triggered.", flush=True)
+        text_lower = text.lower()
+
+        # IMMEDIATE CONTROL COMMANDS (English + Hindi variants)
+        if any(k in text_lower for k in ["kimi stop", "stop speaking", "kimi bas", "kimi ruko"]):
+            print("[CONTROL] Stop triggered.", flush=True)
             stop_speaking()
             return
-        
-        if any(k in text.lower() for k in ["kimi shut down", "kimi shutdown", "kimi band karo", "kimi band"]):
-            print(f"[CONTROL] Shutdown triggered.", flush=True)
+
+        if any(k in text_lower for k in ["kimi shut down", "kimi shutdown", "kimi band karo", "kimi band"]):
+            print("[CONTROL] Shutdown triggered.", flush=True)
             stop_speaking()
             shutdown_event.set()
             return
 
-        # 2. GENERAL BRAIN COMMANDS (Queued)
+        # Queue for main brain
         voice_command_queue.put(text)
-        
-    except sr.UnknownValueError:
-        pass
+
     except Exception as e:
         print(f"[LISTENER_ERROR] {e}", flush=True)
 
@@ -1675,15 +1686,8 @@ def get_ai_response(prompt):
         if not model_name.startswith("models/"):
             model_name = f"models/{model_name}"
         
-        # Tools: Map our registry to types.Tool
-        tools = []
-        for name, spec in TOOL_REGISTRY.items():
-            func_decl = types.FunctionDeclaration(
-                name=name,
-                description=spec["description"],
-                parameters=spec["parameters"]
-            )
-            tools.append(types.Tool(function_declarations=[func_decl]))
+        # Use pre-built tools list (avoids rebuilding 20 FunctionDeclarations per call)
+        tools = _get_gemini_tools()
 
         # Prepare initial chat history
         history = transform_history_for_genai(conversation_history)
@@ -1833,6 +1837,16 @@ def main():
     # Initial boot sequence
     startup_msg = "Kimi is online and ready for you, boss."
     print(f"\n[BOOT] {startup_msg}", flush=True)
+
+    # Pre-warm: initialize Gemini client + tools NOW so first command is instant
+    print("[BOOT] Pre-warming Gemini client and tools...", flush=True)
+    try:
+        _get_gemini_client()
+        _get_gemini_tools()
+        print("[BOOT] Gemini client ready.", flush=True)
+    except Exception as e:
+        print(f"[BOOT_WARN] Gemini pre-warm failed: {e}", flush=True)
+
     speak(startup_msg, block=True)
 
     try:
