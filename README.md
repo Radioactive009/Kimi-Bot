@@ -68,7 +68,7 @@ If API key is missing or API call fails, Kimi responds with a friendly error mes
 
 ### Model deprecation safety
 
-If one model is unavailable or deprecated, Kimi automatically retries fallback models.
+Kimi is configured to use `gemini-1.5-flash-latest` by default. If the primary model fails or is unavailable (e.g., returns a 404 error), Kimi automatically retries using `gemini-1.5-pro-latest` for maximum reliability.
 
 ## AI Agent Tool Calling
 
