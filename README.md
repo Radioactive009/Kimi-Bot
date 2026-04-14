@@ -66,9 +66,9 @@ python kimi.py
 
 If API key is missing or API call fails, Kimi responds with a friendly error message instead of crashing.
 
-### Model deprecation safety
+### Model fallback safety
 
-Kimi is configured to use `gemini-1.5-flash-latest` by default. If the primary model fails or is unavailable (e.g., returns a 404 error), Kimi automatically retries using `gemini-1.5-pro-latest` for maximum reliability.
+Kimi is now powered by the `google-generativeai` SDK. By default, it uses `gemini-1.5-flash`. if the primary model fails, Kimi automatically triggers a robust fallback to `gemini-1.5-pro` for maximum reliability.
 
 ## AI Agent Tool Calling
 

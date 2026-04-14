@@ -318,7 +318,6 @@ def _speak_worker(text, voice=None):
                 # Check if file exists before loading
                 if not os.path.exists(TEMP_AUDIO_FILE):
                      raise FileNotFoundError("[TTS] Audio file vanished before playback.")
-                        raise FileNotFoundError(f"TTS file {TEMP_AUDIO_FILE} not created")
 
                 pygame.mixer.music.load(TEMP_AUDIO_FILE)
                 pygame.mixer.music.play()
