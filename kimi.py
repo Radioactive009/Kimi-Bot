@@ -38,15 +38,13 @@ import speech_recognition as sr
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 try:
-    from google import genai
-    from google.genai import types
+    import google.generativeai as genai
 except ImportError:
-    # If the user doesn't have the new SDK, help them install it.
-    print("[BOOT] Critical: google-genai library is missing. Installing it for you...", flush=True)
+    # If the user doesn't have the SDK, help them install it.
+    print("[BOOT] Critical: google-generativeai library is missing. Installing it for you...", flush=True)
     import subprocess, sys
-    subprocess.run([sys.executable, "-m", "pip", "install", "google-genai"], check=True)
-    from google import genai
-    from google.genai import types
+    subprocess.run([sys.executable, "-m", "pip", "install", "google-generativeai"], check=True)
+    import google.generativeai as genai
 
 try:
     import pywhatkit
@@ -131,23 +129,24 @@ MAX_HISTORY_MESSAGES = 10
 user_memory = {}
 
 # Gemini model fallback chain.
-DEFAULT_MODEL = "gemini-1.5-flash-latest"
+DEFAULT_MODEL = "gemini-1.5-flash"
 FALLBACK_MODELS = [
-    "gemini-1.5-pro-latest",
+    "gemini-1.5-pro",
     "gemini-flash-latest",
 ]
 
-# Cached Gemini client — avoid re-creating on every single call.
-_gemini_client = None
+# Configure Gemini once.
+_genai_configured = False
 
-def _get_gemini_client():
-    """Return a cached Gemini client, creating it once per session."""
-    global _gemini_client
-    if _gemini_client is None:
+def _setup_genai():
+    """Ensure the Gemini SDK is configured with the user's API key."""
+    global _genai_configured
+    if not _genai_configured:
         api_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
         if api_key and genai:
-            _gemini_client = genai.Client(api_key=api_key)
-    return _gemini_client
+            genai.configure(api_key=api_key)
+            _genai_configured = True
+    return _genai_configured
 
 EXIT_KEYWORDS = {
     "exit", "quit", "stop", "kimi stop", "kimi shutdown", "kimi shut down", 
@@ -307,7 +306,10 @@ def _speak_worker(text, voice=None):
                 
             # EXTRA SAFETY: verify file exists before letting pygame touch it
             if not os.path.exists(TEMP_AUDIO_FILE) or os.path.getsize(TEMP_AUDIO_FILE) == 0:
-                 raise FileNotFoundError(f"[TTS] Neural audio file missing or empty: {TEMP_AUDIO_FILE}")
+                 # If file is missing, wait a heartbeat for OS sync, then skip
+                 time.sleep(0.1)
+                 if not os.path.exists(TEMP_AUDIO_FILE) or os.path.getsize(TEMP_AUDIO_FILE) == 0:
+                     raise FileNotFoundError(f"[TTS] Neural audio file missing or empty.")
 
             with speak_lock:
                 if stop_event.is_set():
@@ -315,9 +317,7 @@ def _speak_worker(text, voice=None):
                 
                 # Check if file exists before loading
                 if not os.path.exists(TEMP_AUDIO_FILE):
-                     # If edge-tts failed but didn't throw, try one last check after a short wait
-                     time.sleep(0.2)
-                     if not os.path.exists(TEMP_AUDIO_FILE):
+                     raise FileNotFoundError("[TTS] Audio file vanished before playback.")
                         raise FileNotFoundError(f"TTS file {TEMP_AUDIO_FILE} not created")
 
                 pygame.mixer.music.load(TEMP_AUDIO_FILE)
@@ -1299,20 +1299,20 @@ TOOL_REGISTRY = {
 _CACHED_GEMINI_TOOLS = None
 
 def _get_gemini_tools():
-    """Return pre-built Gemini tools list; build once and cache."""
+    """Return pre-built Gemini tools list compatible with v1 SDK."""
     global _CACHED_GEMINI_TOOLS
-    if _CACHED_GEMINI_TOOLS is None and types:
-        _CACHED_GEMINI_TOOLS = [
-            types.Tool(function_declarations=[
-                types.FunctionDeclaration(
-                    name=name,
-                    description=spec["description"],
-                    parameters=spec["parameters"],
-                )
-            ])
-            for name, spec in TOOL_REGISTRY.items()
-        ]
-    return _CACHED_GEMINI_TOOLS or []
+    if _CACHED_GEMINI_TOOLS is None:
+        # In v1 SDK, we can pass function definitions directly or as Tools.
+        _CACHED_GEMINI_TOOLS = []
+        for name, spec in TOOL_REGISTRY.items():
+            _CACHED_GEMINI_TOOLS.append({
+                "function_declarations": [{
+                    "name": name,
+                    "description": spec["description"],
+                    "parameters": spec["parameters"]
+                }]
+            })
+    return _CACHED_GEMINI_TOOLS
 
 
 def execute_tool_by_name(tool_name, args=None):
@@ -1638,107 +1638,110 @@ def open_chrome():
     return "Chrome was not found, opening Google in your default browser."
 
 def transform_history_for_genai(history):
-    """Transform Kimi role-based history into modern GenAI content blocks."""
-    if not types:
-        return []
-        
+    """Transform Kimi role-based history into v1 SDK content segments."""
     genai_history = []
     for msg in history:
         role = "user" if msg["role"] == "user" else "model"
-        genai_history.append(types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])]))
+        # In v1 SDK, history is list of dicts with role and parts.
+        genai_history.append({
+            "role": role,
+            "parts": [{"text": msg["content"]}]
+        })
     return genai_history
 
 
 def get_ai_response(prompt):
     """
-    Send user prompt to Gemini model with robust retry logic for quota errors.
+    Send user prompt to Gemini model using google-generativeai (v1 SDK).
+    Implements model names: gemini-1.5-flash / gemini-1.5-pro with failure retry.
     """
-    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
-    if not api_key:
-        return "Boss, I'm missing my API key. Check the .env file."
+    if not _setup_genai():
+        return "Boss, I'm missing my API key. Please check the .env file."
 
-    if not genai or not types:
-        return "Legacy AI mode not supported."
+    # Final logic: Force model list to follow user requirement
+    primary_model = os.getenv("KIMI_MODEL", "gemini-1.5-flash")
+    fallback_model = "gemini-1.5-pro"
 
-    model_name = os.getenv("KIMI_MODEL", DEFAULT_MODEL)
-    
-    for attempt in range(2):  # Try twice: Primary then Fallback
+    for attempt in range(2): # Try Primary then Pro
+        current_model_name = primary_model if attempt == 0 else fallback_model
+        
+        if attempt == 1:
+            print(f"[AI_FALLBACK] Primary model failed. Triggering fallback to: {current_model_name}", flush=True)
+
+        print(f"[AI_LOG] Using model: {current_model_name}", flush=True)
+
         try:
-            current_model = model_name
-            if attempt == 1:
-                # RETRY WITH PRO FALLBACK
-                current_model = "gemini-1.5-pro-latest"
-                print(f"[AI_FALLBACK] Primary model failed. Retrying with pro model...", flush=True)
-
-            if not current_model.startswith("models/"):
-                current_model = f"models/{current_model}"
-            
-            print(f"[AI_LOG] Using model: {current_model}", flush=True)
-
-            client = _get_gemini_client()
-            if not client: return "I'm having trouble waking up the AI client right now, boss."
-
-            # Bilingual instructions
-            lang_instruction = "Reply in Hindi (Devanagari/Hinglish)." if current_lang == "hi" else "Reply in English."
-            
-            system_message = (
-                "You are Kimi, a sophisticated, sassy, and seductive personal AI assistant. "
-                "CRITICAL: Be EXTREMELY concise (1-2 sentences). "
-                f"{lang_instruction} "
-                f"{build_memory_context()}"
+            # Reconfiguring model instance on each turn ensures we catch name changes.
+            model = genai.GenerativeModel(
+                model_name=current_model_name,
+                tools=_get_gemini_tools(),
+                system_instruction=(
+                    "You are Kimi, a sophisticated AI assistant. Be extremely concise (1-2 sentences). "
+                    + ("Reply in Hindi." if current_lang == "hi" else "Reply in English.")
+                    + f" {build_memory_context()}"
+                )
             )
 
-            tools = _get_gemini_tools()
-            history = transform_history_for_genai(conversation_history)
-            config = types.GenerateContentConfig(system_instruction=system_message, tools=tools)
-
-            chat = client.chats.create(model=model_name, config=config, history=history)
+            # Start chat with transformed history
+            chat = model.start_chat(history=transform_history_for_genai(conversation_history))
             response = chat.send_message(prompt)
 
-            if not response or not response.candidates:
-                return "I'm drawing a blank right now, boss."
-
+            # Extract text safely as per requirement
             final_reply = ""
-            for part in response.candidates[0].content.parts:
-                if part.text: final_reply += part.text
-                if part.function_call:
-                    t_name = part.function_call.name
-                    t_args = part.function_call.args or {}
-                    print(f"[AI_ACTION] Running {t_name}")
-                    t_result = execute_tool_by_name(t_name, t_args)
+            if response.candidates:
+                # Part 1: Text parts
+                for part in response.candidates[0].content.parts:
+                    if part.text:
+                        final_reply += part.text
                     
-                    try:
-                        f_up = chat.send_message(message=[types.Part.from_function_response(name=t_name, response={"result": t_result})])
-                        if f_up and f_up.candidates:
-                            for r_p in f_up.candidates[0].content.parts:
-                                if r_p.text: final_reply += " " + r_p.text
-                    except Exception as fe:
-                        print(f"Follow-up error: {fe}")
-                        final_reply += " Task done, boss."
+                    # Tool calling part
+                    if part.function_call:
+                        t_name = part.function_call.name
+                        t_args = dict(part.function_call.args)
+                        print(f"[AI_ACTION] Executing tool: {t_name}")
+                        t_result = execute_tool_by_name(t_name, t_args)
+                        
+                        # Send result back
+                        try:
+                            f_up = chat.send_message({
+                                "role": "function",
+                                "parts": [{
+                                    "function_response": {
+                                        "name": t_name,
+                                        "response": {"result": t_result}
+                                    }
+                                }]
+                            })
+                            if f_up.candidates:
+                                for r_p in f_up.candidates[0].content.parts:
+                                    if r_p.text: final_reply += " " + r_p.text
+                        except Exception as fe:
+                            print(f"Tool follow-up error: {fe}")
+                            final_reply += " Task handled, boss."
 
-            final_reply = final_reply.strip() or "Done, boss."
+            final_reply = final_reply.strip() or "I've handled that, boss."
             add_to_history("user", prompt)
             add_to_history("assistant", final_reply)
             return final_reply
 
         except Exception as e:
             err_str = str(e).lower()
-            
-            # Handle 429 separately, don't trigger fallback immediately if it's just quota
+            # If 429 quota, wait and retry SAME model first before switching
             if "429" in err_str or "resource_exhausted" in err_str:
-                if attempt < 1:
-                    print(f"[RETRY] Quota hit. Waiting 5 seconds before retry...", flush=True)
-                    time.sleep(5)
-                    continue
-                return "I'm a bit overwhelmed by too many requests right now, boss."
+                print(f"[RETRY] Quota hit. Waiting 5 seconds...", flush=True)
+                time.sleep(5)
+                # Note: this counts as an 'attempt' in this loop structure, 
+                # but we'll allow it to fallback if it hits twice.
+                if attempt < 1: continue 
             
-            # For 404 or other connection failures, trigger model fallback
             if attempt < 1:
-                print(f"[AI_ERROR] Primary model failed: {e}. Attempting fallback...", flush=True)
+                print(f"[AI_ERROR] Primary failed: {e}")
                 continue
             
-            print(f"GenAI Error: {e}")
-            return "I hit a snag connecting to the brain. Check my logs, boss."
+            print(f"[GENAI_ERROR] Both models failed: {e}")
+            return "I'm having trouble connecting to my AI service right now."
+
+    return "I'm having trouble connecting to my AI service right now."
     
     return "I'm still a bit dazed, boss. Can we try again?"
 
@@ -1823,9 +1826,9 @@ def main():
     # Pre-warm: initialize Gemini client + tools NOW so first command is instant
     print("[BOOT] Pre-warming Gemini client and tools...", flush=True)
     try:
-        _get_gemini_client()
+        _setup_genai()
         _get_gemini_tools()
-        print("[BOOT] Gemini client ready.", flush=True)
+        print("[BOOT] Gemini AI ready.", flush=True)
     except Exception as e:
         print(f"[BOOT_WARN] Gemini pre-warm failed: {e}", flush=True)
 
