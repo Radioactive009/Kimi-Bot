@@ -274,7 +274,10 @@ def _speak_worker(text):
                 
                 # Check if file exists before loading
                 if not os.path.exists(TEMP_AUDIO_FILE):
-                     raise FileNotFoundError(f"TTS file {TEMP_AUDIO_FILE} not created")
+                     # If edge-tts failed but didn't throw, try one last check after a short wait
+                     time.sleep(0.2)
+                     if not os.path.exists(TEMP_AUDIO_FILE):
+                        raise FileNotFoundError(f"TTS file {TEMP_AUDIO_FILE} not created")
 
                 pygame.mixer.music.load(TEMP_AUDIO_FILE)
                 pygame.mixer.music.play()
@@ -897,9 +900,23 @@ def get_cricket_scores():
             except Exception:
                 continue
 
+        # If no live matches, check for upcoming matches for the day
         if not matches:
-            return "There are no live cricket matches currently being tracked."
-        return "Current live scores: " + " | ".join(matches)
+            for match in soup.find_all("div", class_="cb-mtch-lst"):
+                try:
+                    teams = match.find("h3").text.strip()
+                    # Look for date/time or "Scheduled" text
+                    status = match.find("div", class_="cb-text-preview") or match.find("div", class_="cb-nm-tm")
+                    if status:
+                        matches.append(f"{teams} (Scheduled: {status.text.strip()})")
+                    if len(matches) >= 3:
+                        break
+                except Exception:
+                    continue
+
+        if not matches:
+            return "There are no live or upcoming cricket matches currently listed for today."
+        return "Match details: " + " | ".join(matches)
     except Exception as error:
         return f"Cricket score error: {error}"
 
@@ -1003,10 +1020,10 @@ def find_files(file_query, limit=MAX_FILE_SEARCH_RESULTS):
     return matches
 
 
-def search_web(query, max_results=5):
+def search_web(query, max_results=3):
     """
-    Tool: search the web for real-time information, news, sports scores, and more.
-    Uses DuckDuckGo snippets to provide the latest data.
+    Tool: search the web for real-time information.
+    Limited to 3 results to ensure fast responses.
     """
     q = (query or "").strip()
     if not q:
@@ -1344,8 +1361,8 @@ def try_local_quick_actions(command):
         add_to_history("assistant", reply)
         return True, True
 
-    if "cricket score" in text or "score of the match" in text:
-        speak("Fetching the latest cricket scores, boss.")
+    if any(k in text for k in ["cricket", "score", "ipl", "match today", "points table"]):
+        speak("Fetching the latest match details for you, boss.")
         reply = f"{get_cricket_scores()} Hope your team is winning, boss!"
         speak(reply)
         add_to_history("user", command)
@@ -1586,6 +1603,9 @@ def get_ai_response(prompt):
         )
 
         model_name = os.getenv("KIMI_MODEL", "gemini-2.0-flash")
+        # Modern SDK often requires the 'models/' prefix for certain operations
+        if not model_name.startswith("models/"):
+            model_name = f"models/{model_name}"
         
         # Tools: Map our registry to types.Tool
         # Converting TOOL_REGISTRY to function declarations
@@ -1718,6 +1738,10 @@ def process_command(command):
         if not step:
             continue
         ai_reply = get_ai_response(step)
+        # Fast feedback for long AI queries
+        if "latest" in step or "news" in step or "search" in step:
+            speak("I've found some updates for you, boss. Summarizing now...")
+        
         step_responses.append(ai_reply)
 
     if not step_responses:
