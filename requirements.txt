@@ -10,3 +10,4 @@ requests
 edge-tts
 pygame
 google-generativeai
+aiofiles

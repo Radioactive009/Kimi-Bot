@@ -33,6 +33,7 @@ import edge_tts
 import asyncio
 import pyttsx3
 import requests
+import aiofiles
 import speech_recognition as sr
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -108,10 +109,14 @@ try:
 except Exception as e:
     print(f"[BOOT] pygame.mixer error: {e}")
 
-KIMI_VOICE = "en-GB-SoniaNeural"
-KIMI_VOICE = "en-GB-SoniaNeural"
+KIMI_VOICE_EN = "en-GB-SoniaNeural"
+KIMI_VOICE_HI = "hi-IN-SwaraNeural"  # Native Hindi female neural voice
+KIMI_VOICE = KIMI_VOICE_EN  # Default voice, updated dynamically per turn
 # Ensure absolute path for the audio file to avoid locking/access issues between threads
 TEMP_AUDIO_FILE = str(Path("kimi_voice.mp3").absolute())
+
+# Detected language for the current turn: 'en' or 'hi'
+current_lang = "en"
 
 # Lock for thread-safe audio playback.
 speak_lock = threading.Lock()
@@ -130,6 +135,18 @@ DEFAULT_MODEL = "gemini-flash-latest"
 FALLBACK_MODELS = [
     "gemini-1.5-flash",
 ]
+
+# Cached Gemini client — avoid re-creating on every single call.
+_gemini_client = None
+
+def _get_gemini_client():
+    """Return a cached Gemini client, creating it once per session."""
+    global _gemini_client
+    if _gemini_client is None:
+        api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+        if api_key and genai:
+            _gemini_client = genai.Client(api_key=api_key)
+    return _gemini_client
 
 EXIT_KEYWORDS = {
     "exit", "quit", "stop", "kimi stop", "kimi shutdown", "kimi shut down", 
@@ -231,42 +248,56 @@ def speak_powershell(text):
         return False
 
 
+async def _generate_audio_streaming(text, voice):
+    """
+    FAST streaming TTS: write chunks to disk progressively then play.
+    This removes the "wait for full file" bottleneck.
+    """
+    communicate = edge_tts.Communicate(text, voice)
+    # Use a temp path unique per call to avoid race conditions
+    tmp_path = TEMP_AUDIO_FILE
+    async with aiofiles.open(tmp_path, "wb") as f:
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                await f.write(chunk["data"])
+    if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+        raise FileNotFoundError(f"[TTS] Streaming produced empty file: {tmp_path}")
+
 async def _generate_audio(text):
-    """Fetch neural audio from Edge TTS and save to temporary file."""
+    """Legacy save-to-file TTS — used as fallback if streaming fails."""
     communicate = edge_tts.Communicate(text, KIMI_VOICE)
     await communicate.save(TEMP_AUDIO_FILE)
-    # Verifying file creation for debug logging
     if not os.path.exists(TEMP_AUDIO_FILE):
         print(f"[TTS_DEBUG] Edge TTS reports success but file {TEMP_AUDIO_FILE} is missing.", flush=True)
     else:
-        # Small delay to ensure Windows OS has finished syncing the file to disk
-        # before the player attempts to read it.
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.05)
 
 
-def _speak_worker(text):
+def _speak_worker(text, voice=None):
     """
     Internal worker to handle audio playback.
-    Prioritizes high-quality Edge TTS with pygame playback.
+    Uses fast streaming TTS (Edge TTS) with pygame playback.
+    Falls back to pyttsx3 / PowerShell on failure.
     """
     global engine
+    chosen_voice = voice or KIMI_VOICE
     try:
         # User-forced fallback to PowerShell.
         if os.getenv("FORCE_POWERSHELL_TTS", "false").lower() == "true":
             speak_powershell(text)
             return
 
-        # Attempt high-quality neural TTS
+        # Attempt high-quality neural TTS (streaming for speed)
         try:
-            # RELEASE LOCK: Ensure pygame mixer unloads the file before we try to write a new one
-            # This is critical on Windows to avoid "Permission Denied" errors.
+            # Unload any previously loaded file on Windows to avoid permission errors.
             try:
                 if pygame.mixer.get_init():
                     pygame.mixer.music.unload()
             except:
                 pass
 
-            asyncio.run(_generate_audio(text))
+            # --- FAST PATH: Streaming TTS ---
+            asyncio.run(_generate_audio_streaming(text, chosen_voice))
             
             with speak_lock:
                 if stop_event.is_set():
@@ -309,21 +340,23 @@ def _speak_worker(text):
         print(f"Speech thread error: {error}")
         speak_powershell(text)
 
-def speak(text, block=False):
+def speak(text, block=False, voice=None):
     """
     Convert text to speech. Prints text and plays audio asynchronously by default.
     Set block=True for startup or critical messages that must finish before proceeding.
+    Pass voice= to override the TTS voice (e.g., for Hindi).
     """
     print(f"Kimi: {text}")
     
     # Always clear stop event before starting new speech
     stop_event.clear()
 
+    chosen_voice = voice or KIMI_VOICE
     if block:
-        _speak_worker(text)
+        _speak_worker(text, voice=chosen_voice)
     else:
         # Run speech in background thread so the main program can listen for "Kimi stop"
-        threading.Thread(target=_speak_worker, args=(text,), daemon=True).start()
+        threading.Thread(target=_speak_worker, args=(text,), kwargs={"voice": chosen_voice}, daemon=True).start()
 
 
 def stop_speaking():
@@ -1506,38 +1539,62 @@ def unified_voice_callback(recognizer, audio):
     The PRIMARY voice listener. It runs in its own background thread.
     - Captures all audio.
     - Handles 'Kimi stop' and 'Kimi shut down' immediately.
+    - Detects language (Hindi vs English) and sets the TTS voice accordingly.
     - Puts everything else in the voice_command_queue for the main brain.
     """
+    global current_lang, KIMI_VOICE
     try:
         # Avoid processing until the listener is fully ready
         if not stop_listening_callback:
             return
 
-        text = recognizer.recognize_google(audio).lower().strip()
+        text = None
+        detected_lang = "en"
+
+        # Try Hindi first (hi-IN), then fall back to English
+        try:
+            text = recognizer.recognize_google(audio, language="hi-IN").strip()
+            if text:
+                # Heuristic: if recognized Hindi text contains a significant proportion
+                # of Devanagari characters it's really Hindi, otherwise treat as English.
+                devanagari_chars = sum(1 for c in text if '\u0900' <= c <= '\u097F')
+                if devanagari_chars >= 2 or len(text) > 0 and devanagari_chars / max(len(text), 1) > 0.1:
+                    detected_lang = "hi"
+                else:
+                    # Probably mis-recognized English as Hindi — re-run with English
+                    text = recognizer.recognize_google(audio, language="en-IN").strip()
+                    detected_lang = "en"
+        except sr.UnknownValueError:
+            try:
+                text = recognizer.recognize_google(audio, language="en-IN").strip()
+                detected_lang = "en"
+            except sr.UnknownValueError:
+                return
+
         if not text:
             return
-            
-        print(f"[LISTENER_LOG] Heard: '{text}'", flush=True)
 
-        # 1. IMMEDIATE CONTROL COMMANDS (Interrupts)
-        if "kimi stop" in text or "stop speaking" in text:
+        # Update global language state and TTS voice for this turn
+        current_lang = detected_lang
+        KIMI_VOICE = KIMI_VOICE_HI if detected_lang == "hi" else KIMI_VOICE_EN
+        print(f"[LISTENER_LOG] Lang={detected_lang.upper()} | Heard: '{text}'", flush=True)
+
+        # 1. IMMEDIATE CONTROL COMMANDS (support Hindi: "kimi bas", "kimi ruko")
+        if any(k in text.lower() for k in ["kimi stop", "stop speaking", "kimi bas", "kimi ruko"]):
             print(f"[CONTROL] Stop triggered.", flush=True)
             stop_speaking()
             return
         
-        if "kimi shut down" in text or "kimi shutdown" in text:
-            # Stricter matching for shutdown to avoid misfires
+        if any(k in text.lower() for k in ["kimi shut down", "kimi shutdown", "kimi band karo", "kimi band"]):
             print(f"[CONTROL] Shutdown triggered.", flush=True)
             stop_speaking()
             shutdown_event.set()
             return
 
         # 2. GENERAL BRAIN COMMANDS (Queued)
-        # We put it in the queue so the main thread processes it when ready
         voice_command_queue.put(text)
         
     except sr.UnknownValueError:
-        # Standard noise/unclear speech
         pass
     except Exception as e:
         print(f"[LISTENER_ERROR] {e}", flush=True)
@@ -1587,18 +1644,29 @@ def get_ai_response(prompt):
         return get_ai_response_legacy(prompt)
 
     try:
-        client = genai.Client(api_key=api_key)
+        # Use cached client — avoids per-call SDK initialization overhead (~200-400ms)
+        client = _get_gemini_client()
+        if not client:
+            return "Boss, the Gemini client could not be initialized. Check your API key."
+
+        # Choose language-specific instruction for bilingual support
+        lang_instruction = (
+            "The user is speaking HINDI. Reply in Hindi (Devanagari script is fine, but Hinglish is also great). "
+            "Match their language style exactly. Still call them 'boss' (or 'boss ji' for warmth)."
+            if current_lang == "hi" else
+            "The user is speaking English. Reply in English."
+        )
         
         system_message = (
-            "You are Kimi, a sophisticated, sassy, and seductive personal AI assistant. "
+            "You are Kimi, a sophisticated, sassy, and seductive personal AI assistant who is fully bilingual. "
             "You address the user as 'boss' with respect, admiration, and a hint of sass. "
             "You can control the user's computer and perform tasks. "
-            "CRITICAL: Be EXTREMELY concise. Never read back raw data, long lists, or search snippets directly. "
-            "If a tool returns search results, summaries of files, or app lists, you MUST synthesize "
-            "a short, witty, and human-like answer (1-2 sentences max). "
-            "Never say 'Here is what I found online' followed by a list. Instead say something like "
-            "'Looks like the IPL match today is between X and Y, boss. I'd bet on X if I were you.'"
-            "Always maintain your seductive and elegant persona while being brief."
+            "CRITICAL: Be EXTREMELY concise. Keep answers to 1-2 sentences max. "
+            "Never read back raw data, long lists, or search snippets directly. "
+            "Synthesize a short, witty, human-like answer. "
+            "Never say 'Here is what I found' followed by a list. Instead give a punchy one-liner summary. "
+            "Always maintain your seductive and elegant persona while being brief. "
+            f"{lang_instruction} "
             f"{build_memory_context()}"
         )
 
@@ -1608,7 +1676,6 @@ def get_ai_response(prompt):
             model_name = f"models/{model_name}"
         
         # Tools: Map our registry to types.Tool
-        # Converting TOOL_REGISTRY to function declarations
         tools = []
         for name, spec in TOOL_REGISTRY.items():
             func_decl = types.FunctionDeclaration(
@@ -1621,16 +1688,13 @@ def get_ai_response(prompt):
         # Prepare initial chat history
         history = transform_history_for_genai(conversation_history)
         
-        # We start a session. The new SDK handles multi-turn interactions.
-        # However, to maintain fine control over the tool loop, we'll manually send the message.
         config = types.GenerateContentConfig(
             system_instruction=system_message,
             tools=tools,
         )
 
-        # First turn
+        # First turn — use cached client, pass history
         try:
-            # We use chat to keep history management automatically
             chat = client.chats.create(model=model_name, config=config, history=history)
             response = chat.send_message(prompt)
         except Exception as e:
@@ -1748,11 +1812,13 @@ def process_command(command):
         speak("Can you repeat that?")
         return True
 
+    # Speak using the voice selected during the recognition phase
+    reply_voice = KIMI_VOICE_HI if current_lang == "hi" else KIMI_VOICE_EN
     if len(step_responses) == 1:
-        speak(step_responses[0])
+        speak(step_responses[0], voice=reply_voice)
     else:
         # Multi-step summary keeps response descriptive and not just "Done".
-        speak(" Then ".join(step_responses))
+        speak(" Then ".join(step_responses), voice=reply_voice)
 
     return True
 
