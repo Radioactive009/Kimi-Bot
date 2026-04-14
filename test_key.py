@@ -1,28 +1,29 @@
 import os
-from groq import Groq
-from dotenv import load_dotenv
 
-# Load environment variables from .env
+from dotenv import load_dotenv
+from google import genai
+
 load_dotenv()
 
-def test_groq_key():
-    api_key = os.getenv("GROQ_API_KEY")
+
+def test_gemini_key():
+    api_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
     if not api_key:
-        print("ERROR: GROQ_API_KEY not found in .env")
+        print("ERROR: GEMINI_API_KEY (or GOOGLE_API_KEY) not found in .env")
         return
 
-    print(f"Testing key: {api_key[:10]}...")
+    print(f"Testing key prefix: {api_key[:10]}...")
     try:
-        client = Groq(api_key=api_key)
-        response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": "Hello, responder with 'Key is valid'"}],
-            max_tokens=10
+        client = genai.Client(api_key=api_key, http_options={"api_version": "v1"})
+        response = client.models.generate_content(
+            model="models/gemini-1.5-flash",
+            contents="Reply with exactly: Key is valid",
         )
         print("SUCCESS: API call worked!")
-        print(f"Response: {response.choices[0].message.content}")
+        print(f"Response: {response.text}")
     except Exception as e:
         print(f"FAILED: {e}")
 
+
 if __name__ == "__main__":
-    test_groq_key()
+    test_gemini_key()

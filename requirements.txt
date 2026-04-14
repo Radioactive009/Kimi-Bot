@@ -1,7 +1,6 @@
 SpeechRecognition
 pyttsx3
 PyAudio
-groq
 python-dotenv
 pywhatkit
 duckduckgo-search
@@ -11,3 +10,6 @@ edge-tts
 pygame
 google-genai
 aiofiles
+fastapi
+uvicorn
+psutil

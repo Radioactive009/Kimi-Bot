@@ -37,47 +37,23 @@ import aiofiles
 import speech_recognition as sr
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+
 try:
     from google import genai
     from google.genai import types
 except ImportError:
-    # If the user doesn't have the SDK, help them install it.
-    print("[BOOT] Critical: google-genai library is missing. Installing it for you...", flush=True)
-    import subprocess, sys
-    subprocess.run([sys.executable, "-m", "pip", "install", "google-genai"], check=True)
-    from google import genai
-    from google.genai import types
+    genai = None
+    types = None
+    print(
+        "[BOOT] Critical: google-genai is missing. "
+        "Install dependencies with: pip install -r requirements.txt",
+        flush=True,
+    )
 
 try:
     import pywhatkit
 except ImportError:
     pywhatkit = None
-
-def install_missing_packages():
-    """
-    Attempts to install required libraries if they are missing.
-    Helps ensure Kimi's 'Online Surfing' feature works without manual setup.
-    """
-    required = ["duckduckgo-search", "requests", "beautifulsoup4"]
-    for package in required:
-        try:
-            # Check if package is already there
-            if package == "duckduckgo-search":
-                import duckduckgo_search
-            elif package == "beautifulsoup4":
-                import bs4
-            else:
-                __import__(package.replace("-", "_"))
-        except ImportError:
-            print(f"[BOOT] Installing missing package: {package}...", flush=True)
-            try:
-                subprocess.run([sys.executable, "-m", "pip", "install", package], capture_output=True, check=True)
-                print(f"[BOOT] Successfully installed {package}!")
-            except Exception as e:
-                print(f"[BOOT] Failed to install {package}: {e}")
-
-# Redundant sys import removed
-install_missing_packages()
 
 try:
     try:
@@ -131,12 +107,6 @@ MAX_HISTORY_MESSAGES = 10
 user_memory = {}
 
 # Gemini model fallback chain.
-DEFAULT_MODEL = "gemini-1.5-flash"
-FALLBACK_MODELS = [
-    "gemini-1.5-pro",
-    "gemini-flash-latest",
-]
-
 # Cached Gemini client — avoid re-creating on every single call.
 _gemini_client = None
 
@@ -166,10 +136,9 @@ stop_listening_callback = None
 
 # Global audio resources to avoid multiple instance conflicts on Windows
 global_recognizer = sr.Recognizer()
-global_mic = sr.Microphone()
+global_mic = None
 # Queue for passing voice commands from background listener to main thread
 voice_command_queue = queue.Queue()
-MAX_LISTEN_RETRIES = 3
 MAX_FILE_SEARCH_RESULTS = 10
 MAX_APP_LIST_RESULTS = 25
 APP_INDEX_CACHE = None
@@ -182,13 +151,6 @@ AGENT_ACTION_ACKS = [
     "I'll handle it immediately, boss. Don't worry your pretty little head.",
     "Right away, boss. Keep those commands coming.",
 ]
-AGENT_STARTUP_LINES = [
-    "Kimi is here, boss. Did you miss me?",
-    "I'm back. I hope you haven't been too lonely without me, boss.",
-    "Awaiting your instructions, boss. Make them worth my while.",
-]
-
-
 def configure_voice():
     """
     Configure a sharp, youthful, and sassy female voice.
@@ -394,13 +356,6 @@ def stop_speaking():
     except Exception as e:
         print(f"Error stopping engine: {e}")
     
-    # Also attempt to kill any background powershell TTS processes
-    try:
-        subprocess.run(["taskkill", "/IM", "powershell.exe", "/F"], capture_output=True, check=False)
-    except:
-        pass
-
-
 def compose_action_reply(text):
     """
     Add a polished acknowledgement so Kimi sounds more like a premium agent.
@@ -1742,10 +1697,6 @@ def get_ai_response(prompt):
 
     return "I'm having trouble connecting to my AI service right now."
 
-    return "I'm having trouble connecting to my AI service right now."
-    
-    return "I'm still a bit dazed, boss. Can we try again?"
-
 
 def process_command(command):
     """
@@ -1818,7 +1769,7 @@ def main():
     Run Kimi using a Unified Listener architecture.
     The main thread waits on a command queue, while a single background thread handles the mic.
     """
-    global stop_listening_callback
+    global stop_listening_callback, global_mic
 
     # Initial boot sequence
     startup_msg = "Kimi is online and ready for you, boss."
@@ -1836,6 +1787,9 @@ def main():
     speak(startup_msg, block=True)
 
     try:
+        if global_mic is None:
+            global_mic = sr.Microphone()
+
         # Calibrate ambient noise ONCE before starting the unified listener
         print("[BOOT] Calibrating microphone... Please stay quiet.", flush=True)
         with global_mic as source:
@@ -1900,8 +1854,7 @@ def main():
     except:
         pass
 
-    # Force exit to ensure no lingering threads hold up the terminal
-    os._exit(0)
+    return
 
 
 
